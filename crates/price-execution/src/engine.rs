@@ -1,11 +1,9 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use chrono::Utc;
 use tracing::{info, warn, error, debug};
-use price_core::{TickData, Candle, EngineEvent, Result, PriceError};
+use price_core::{TickData, EngineEvent, Result};
 use price_broker::{Broker, OrderRequest, Side, Position};
-use price_indicators::{VwapCalculator, GeometryEngine, TrendGeometry, AtrCalculator, CandleAggregator};
-use price_strategy::{OpportunityEngine, ExitEvaluator, Decision, ExitReason};
+use price_indicators::{VwapCalculator, GeometryEngine, AtrCalculator, CandleAggregator};
+use price_strategy::{OpportunityEngine, ExitEvaluator, Decision};
 use price_risk::RiskEngine;
 
 pub struct ExecutionOrchestrator {
@@ -18,6 +16,7 @@ pub struct ExecutionOrchestrator {
     candle_aggregator: CandleAggregator,
     atr_calc: AtrCalculator,
     price_history: Vec<f64>,
+    closed_candles: Vec<price_core::Candle>,
     
     // Live Indicators
     current_atr: f64,
@@ -51,6 +50,7 @@ impl ExecutionOrchestrator {
             candle_aggregator: CandleAggregator::new(),
             atr_calc: AtrCalculator::new(14),
             price_history: Vec::new(),
+            closed_candles: Vec::new(),
             current_atr: 12.0,
             current_vix: 15.0,
             current_spread: 0.20,
@@ -91,6 +91,10 @@ impl ExecutionOrchestrator {
         if let Some(closed_candle) = self.candle_aggregator.ingest_tick(&tick) {
             // Update ATR when a candle closes
             self.current_atr = self.atr_calc.update(closed_candle.clone());
+            self.closed_candles.push(closed_candle.clone());
+            if self.closed_candles.len() > 100 {
+                self.closed_candles.remove(0);
+            }
             info!("Candle closed: {:?}. New ATR: {:.2}", closed_candle, self.current_atr);
             events.push(EngineEvent::CandleClosed(closed_candle));
         }
@@ -206,6 +210,30 @@ impl ExecutionOrchestrator {
             let oi_increasing = tick.volume > 5000; 
             let volume_spike = tick.volume > 10000;
 
+            let pattern = if !self.closed_candles.is_empty() {
+                price_indicators::detect_patterns(&self.closed_candles)
+                    .last()
+                    .cloned()
+                    .unwrap_or(price_indicators::Pattern::None)
+            } else {
+                price_indicators::Pattern::None
+            };
+
+            let fib_confluence_score = if let Some(fib) = price_indicators::calculate_fib_levels(&self.closed_candles) {
+                price_indicators::calculate_confluence_score(tick.price, &fib, 15.0)
+            } else {
+                0.0
+            };
+
+            let sr_zones = price_indicators::calculate_sr_zones(&self.closed_candles, 15.0);
+            let sr_proximity_score = sr_zones.iter()
+                .filter(|z| !z.is_resistance)
+                .map(|z| {
+                    let diff = (tick.price - z.price).abs();
+                    (1.0 - diff / 25.0).max(0.0)
+                })
+                .fold(0.0f64, |acc: f64, val: f64| acc.max(val));
+
             let (opportunity, decision) = self.opportunity_engine.evaluate_entry(
                 tick.price,
                 current_vwap,
@@ -214,6 +242,9 @@ impl ExecutionOrchestrator {
                 volume_spike,
                 &geometry,
                 self.current_ml_confidence,
+                pattern,
+                fib_confluence_score,
+                sr_proximity_score,
             );
 
             events.push(EngineEvent::ConfidenceUpdated {
@@ -243,7 +274,13 @@ impl ExecutionOrchestrator {
                     
                     // Dynamic Strike calculation: round Nifty spot to nearest 50 strikes
                     let strike = (self.current_nifty_spot / 50.0).round() * 50.0;
-                    let prefix = std::env::var("ACTIVE_EXPIRY_PREFIX").unwrap_or_else(|_| "NSE:NIFTY26730".to_string());
+                    
+                    // Calculate target expiry dynamics
+                    let tick_date = tick.timestamp.naive_utc().date();
+                    let holidays = price_core::get_nse_holidays_2026();
+                    let expiry_date = price_core::calculate_nifty_expiry(tick_date, &holidays);
+                    let suffix = price_core::format_fyers_expiry_suffix(expiry_date);
+                    let prefix = format!("NSE:NIFTY{}", suffix);
                     
                     let target_symbol = if is_bullish {
                         format!("{}{:.0}CE", prefix, strike)

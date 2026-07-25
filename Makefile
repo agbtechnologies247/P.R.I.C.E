@@ -1,6 +1,6 @@
 # Makefile for PRICE Quantitative Trading Engine
 
-.PHONY: build test run-worker run-server run-python-broker clean
+.PHONY: build test run-worker run-server run-python-broker clean db-up db-down
 
 build:
 	cargo build
@@ -19,3 +19,9 @@ run-python-broker:
 
 clean:
 	cargo clean
+
+db-up:
+	docker compose up -d
+
+db-down:
+	docker compose down

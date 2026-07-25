@@ -1,7 +1,7 @@
 use axum::{
     routing::{get, post},
     Json, Router, Extension,
-    response::Html,
+    response::{Html, IntoResponse},
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use price_broker::{Broker, PaperBroker, FyersClient, OrderRequest, Side};
 
 struct AppState {
     broker: Arc<dyn Broker>,
+    python_broker_url: String,
 }
 
 #[tokio::main]
@@ -38,7 +39,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(FyersClient::new(&python_broker_url))
     };
 
-    let state = Arc::new(AppState { broker });
+    let state = Arc::new(AppState {
+        broker,
+        python_broker_url,
+    });
 
     // 3. Build routes
     let app = Router::new()
@@ -48,6 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/orders", get(orders_handler))
         .route("/trades", get(trades_handler))
         .route("/order", post(place_order_handler))
+        .route("/broker/auth_url", get(auth_url_handler))
+        .route("/broker/login_token", post(login_token_handler))
         .layer(Extension(state));
 
     // 4. Run server
@@ -640,3 +646,58 @@ async fn place_order_handler(
         })),
     }
 }
+
+async fn auth_url_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    let client = reqwest::Client::new();
+    match client.get(format!("{}/auth_url", state.python_broker_url)).send().await {
+        Ok(res) => {
+            let status = axum::http::StatusCode::from_u16(res.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            let body = res.json::<serde_json::Value>().await.unwrap_or_else(|_| {
+                serde_json::json!({"status": "error", "detail": "Failed to parse Python response"})
+            });
+            (status, Json(body)).into_response()
+        }
+        Err(e) => {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"status": "error", "detail": e.to_string()})),
+            ).into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct LoginTokenRequest {
+    auth_code: String,
+}
+
+async fn login_token_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(payload): Json<LoginTokenRequest>,
+) -> impl axum::response::IntoResponse {
+    let client = reqwest::Client::new();
+    match client.post(format!("{}/login_token", state.python_broker_url))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(res) => {
+            let status = axum::http::StatusCode::from_u16(res.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            let body = res.json::<serde_json::Value>().await.unwrap_or_else(|_| {
+                serde_json::json!({"status": "error", "detail": "Failed to parse Python response"})
+            });
+            (status, Json(body)).into_response()
+        }
+        Err(e) => {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"status": "error", "detail": e.to_string()})),
+            ).into_response()
+        }
+    }
+}
+

@@ -7,8 +7,11 @@ members = [
     "crates/price-strategy",
     "crates/price-risk",
     "crates/price-execution",
+    "crates/price-timeseries",
+    "crates/price-backtester",
     "apps/price-worker",
-    "apps/price-server"
+    "apps/price-server",
+    "apps/price-cli"
 ]
 
 [workspace.dependencies]
@@ -32,3 +35,5 @@ governor = "0.8"
 rust_decimal = { version = "1", features = ["serde"] }
 dotenvy = "0.15"
 tokio-tungstenite = "0.21"
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-native-tls", "chrono", "uuid"] }
+clap = { version = "4", features = ["derive"] }

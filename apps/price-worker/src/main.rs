@@ -46,7 +46,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "3".to_string())
         .parse::<i32>()?;
 
-    let expiry_prefix = std::env::var("ACTIVE_EXPIRY_PREFIX").unwrap_or_else(|_| "NSE:NIFTY26730".to_string());
 
     // 3. Setup Broker abstraction
     let broker: Arc<dyn Broker> = if use_simulated {
@@ -230,8 +229,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if ws_tick.symbol == "NSE:NIFTY50-INDEX" {
                                             let strike = (ws_tick.price / 50.0).round() * 50.0;
                                             if last_subscribed_strike != Some(strike) {
-                                                let new_ce = format!("{}{:.0}CE", expiry_prefix, strike);
-                                                let new_pe = format!("{}{:.0}PE", expiry_prefix, strike);
+                                                let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
+                                                    .unwrap_or_else(Utc::now);
+                                                let tick_date = tick_time.naive_utc().date();
+                                                let holidays = price_core::get_nse_holidays_2026();
+                                                let expiry_date = price_core::calculate_nifty_expiry(tick_date, &holidays);
+                                                let suffix = price_core::format_fyers_expiry_suffix(expiry_date);
+                                                let current_expiry_prefix = format!("NSE:NIFTY{}", suffix);
+
+                                                let new_ce = format!("{}{:.0}CE", current_expiry_prefix, strike);
+                                                let new_pe = format!("{}{:.0}PE", current_expiry_prefix, strike);
                                                 
                                                 let client_clone = http_client.clone();
                                                 let url_clone = python_broker_url.clone();
@@ -251,21 +258,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
 
                                         // 3. Filter and pipe active option contracts + index/VIX ticks to Orchestrator
+                                        let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
+                                            .unwrap_or_else(Utc::now);
+                                        let tick_date = tick_time.naive_utc().date();
+                                        let holidays = price_core::get_nse_holidays_2026();
+                                        let expiry_date = price_core::calculate_nifty_expiry(tick_date, &holidays);
+                                        let suffix = price_core::format_fyers_expiry_suffix(expiry_date);
+                                        let current_expiry_prefix = format!("NSE:NIFTY{}", suffix);
+
                                         let is_active_option = if let Some(strike) = last_subscribed_strike {
-                                            let active_ce = format!("{}{:.0}CE", expiry_prefix, strike);
-                                            let active_pe = format!("{}{:.0}PE", expiry_prefix, strike);
+                                            let active_ce = format!("{}{:.0}CE", current_expiry_prefix, strike);
+                                            let active_pe = format!("{}{:.0}PE", current_expiry_prefix, strike);
                                             ws_tick.symbol == active_ce || ws_tick.symbol == active_pe
                                         } else {
                                             false
                                         };
 
                                         if ws_tick.symbol == "NSE:NIFTY50-INDEX" || ws_tick.symbol == "NSE:INDIAVIX-INDEX" || is_active_option {
+                                            let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
+                                                .unwrap_or_else(Utc::now);
                                             let tick = TickData {
                                                 symbol: ws_tick.symbol.clone(),
                                                 price: ws_tick.price,
                                                 volume: ws_tick.volume,
                                                 oi: ws_tick.oi,
-                                                timestamp: Utc::now(),
+                                                timestamp: tick_time,
                                             };
                                             
                                             match orchestrator.ingest_tick(tick).await {

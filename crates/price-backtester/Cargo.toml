@@ -1,0 +1,24 @@
+[package]
+name = "price-backtester"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+price-core = { path = "../price-core" }
+price-broker = { path = "../price-broker" }
+price-indicators = { path = "../price-indicators" }
+price-strategy = { path = "../price-strategy" }
+price-risk = { path = "../price-risk" }
+price-execution = { path = "../price-execution" }
+price-timeseries = { path = "../price-timeseries" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }

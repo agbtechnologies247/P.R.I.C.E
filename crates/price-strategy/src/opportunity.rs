@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use price_indicators::TrendGeometry;
+use price_indicators::{TrendGeometry, Pattern};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeOpportunity {
@@ -50,66 +50,81 @@ impl OpportunityEngine {
         volume_spike: bool,
         geometry: &TrendGeometry,
         ml_prediction: f64, // 0.0 to 100.0 confidence
+        pattern: Pattern,
+        fib_confluence_score: f64,
+        sr_proximity_score: f64,
     ) -> (TradeOpportunity, Decision) {
-        // Calculate the Entry Score based on weights:
-        // VWAP: 20
-        // WMA Geometry: 20
-        // OI: 15
-        // Volume: 15
-        // Liquidity: 10 (we assume 10 if spread is tight)
+        // Calculate the Entry Score based on weights (100 total):
+        // VWAP: 15
+        // WMA Geometry: 15
+        // OI: 10
+        // Volume: 10
+        // Liquidity: 10
         // India VIX: 10
         // ML Prediction: 10
+        // Price Action Pattern: 10
+        // Fibonacci Confluence: 10
+        // Support/Resistance Proximity: 10
         let mut score = 0.0;
 
-        // 1. VWAP (20 points): Price is above VWAP (for Buy/Bullish intent)
+        // 1. VWAP (15 points)
         if price > vwap {
-            score += 20.0;
+            score += 15.0;
         } else {
-            // Give partial points if it's extremely close
             let dist = (price - vwap).abs() / vwap;
             if dist < 0.001 {
-                score += 10.0;
+                score += 7.5;
             }
         }
 
-        // 2. WMA Geometry (20 points): Expansion is beginning or trend has strong slope
+        // 2. WMA Geometry (15 points)
         if geometry.expansion > 0.0 && geometry.slope > 0.0 {
-            score += 20.0;
+            score += 15.0;
         } else if geometry.slope > 0.0 {
+            score += 7.5;
+        }
+
+        // 3. OI (10 points)
+        if oi_increasing {
             score += 10.0;
         }
 
-        // 3. OI (15 points)
-        if oi_increasing {
-            score += 15.0;
-        }
-
-        // 4. Volume (15 points)
+        // 4. Volume (10 points)
         if volume_spike {
-            score += 15.0;
+            score += 10.0;
         }
 
-        // 5. Liquidity (10 points): Assume OK for Nifty/BankNifty index options
+        // 5. Liquidity (10 points)
         score += 10.0;
 
-        // 6. India VIX (10 points): VIX between 10 and 22 is generally favorable for scalping
+        // 6. India VIX (10 points)
         if vix >= 10.0 && vix <= 22.0 {
             score += 10.0;
         } else if vix < 10.0 {
-            score += 5.0; // low volatility means smaller targets
+            score += 5.0;
         }
 
         // 7. ML Prediction (10 points)
         score += (ml_prediction / 100.0) * 10.0;
 
+        // 8. Price Action Pattern (10 points)
+        match pattern {
+            Pattern::BullishEngulfing | Pattern::PinBar => score += 10.0,
+            Pattern::InsideBar => score += 5.0,
+            Pattern::Doji => score += 3.0,
+            _ => {}
+        }
+
+        // 9. Fibonacci Confluence (10 points)
+        score += fib_confluence_score.min(1.0).max(0.0) * 10.0;
+
+        // 10. Support/Resistance Proximity (10 points)
+        score += sr_proximity_score.min(1.0).max(0.0) * 10.0;
+
         let confidence = score;
-
-        // Probability estimate
         let probability = confidence / 100.0;
-
-        // Target estimation
-        let reward = 30.0; // default points
-        let risk = 10.0;   // default stop loss
+        let reward = 30.0;
+        let risk = 10.0;
 
         let opportunity = TradeOpportunity {
             probability,

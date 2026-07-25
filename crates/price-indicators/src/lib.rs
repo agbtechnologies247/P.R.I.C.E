@@ -3,9 +3,15 @@ pub mod vwap;
 pub mod geometry;
 pub mod atr;
 pub mod candle_aggregator;
+pub mod price_action;
+pub mod support_resistance;
+pub mod fibonacci;
 
 pub use wma::calculate_wma;
 pub use vwap::VwapCalculator;
 pub use geometry::{TrendGeometry, TrendDNA, GeometryEngine};
 pub use atr::AtrCalculator;
 pub use candle_aggregator::CandleAggregator;
+pub use price_action::{detect_patterns, Pattern};
+pub use support_resistance::{calculate_sr_zones, SrZone};
+pub use fibonacci::{calculate_fib_levels, calculate_confluence_score, FibLevels};
