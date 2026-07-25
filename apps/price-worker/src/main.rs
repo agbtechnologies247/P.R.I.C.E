@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Setup Broker abstraction
     let broker: Arc<dyn Broker> = if use_simulated {
         info!("Using high-fidelity in-memory PaperBroker...");
-        Arc::new(PaperBroker::new(100000.0))
+        Arc::new(PaperBroker::new(10000.0))
     } else {
         info!("Connecting to Python Broker Bridge at {}...", python_broker_url);
         let client = FyersClient::new(&python_broker_url);

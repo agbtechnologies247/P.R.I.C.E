@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         
     let broker: Arc<dyn Broker> = if use_simulated {
-        Arc::new(PaperBroker::new(100000.0))
+        Arc::new(PaperBroker::new(10000.0))
     } else {
         Arc::new(FyersClient::new(&python_broker_url))
     };
