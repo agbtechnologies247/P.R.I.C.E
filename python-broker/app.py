@@ -1,9 +1,13 @@
 import os
 import time
+import asyncio
+import threading
+import sqlite3
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from fyers_apiv3 import fyersModel
+from fyers_apiv3.FyersWebsocket import data_ws
 
 # Load .env configuration programmatically
 env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -21,8 +25,36 @@ if os.path.exists(env_path):
 
 app = FastAPI(title="PRICE Python Broker Adapter (Fyers Bridge)")
 
+# Database Configuration
+DB_PATH = os.path.join(os.getcwd(), "price_history.db")
+
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS historical_candles (
+                symbol TEXT,
+                timestamp INTEGER,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume INTEGER,
+                PRIMARY KEY (symbol, timestamp)
+            )
+        """)
+        conn.commit()
+        conn.close()
+        print(f"SQLite database initialized at {DB_PATH}")
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+
 # Real Fyers Client reference
 fyers_client = None
+fyers_socket = None
+main_loop = None
+connected_ws: List[WebSocket] = []
 
 class OrderRequest(BaseModel):
     symbol: str
@@ -48,9 +80,82 @@ class HistoryRequest(BaseModel):
 class TokenRequest(BaseModel):
     auth_code: str
 
+class SubscribeRequest(BaseModel):
+    symbols: List[str]
+
+# Event Handlers for Websocket Thread
+def on_open():
+    print("Fyers Live Market Data Socket connection established.")
+    # Standard initial symbols (Nifty index + 50 constituents)
+    symbols = [
+        "NSE:NIFTY50-INDEX",
+        "NSE:RELIANCE-EQ", "NSE:BHARTIARTL-EQ", "NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ",
+        "NSE:SBIN-EQ", "NSE:TCS-EQ", "NSE:BAJFINANCE-EQ", "NSE:LT-EQ", "NSE:HINDUNILVR-EQ",
+        "NSE:SUNPHARMA-EQ", "NSE:MARUTI-EQ", "NSE:INFY-EQ", "NSE:TITAN-EQ", "NSE:ADANIENT-EQ",
+        "NSE:ADANIPORTS-EQ", "NSE:M&M-EQ", "NSE:KOTAKBANK-EQ", "NSE:AXISBANK-EQ", "NSE:ITC-EQ",
+        "NSE:ULTRACEMCO-EQ", "NSE:HCLTECH-EQ", "NSE:NTPC-EQ", "NSE:ONGC-EQ", "NSE:BAJAJ-AUTO-EQ",
+        "NSE:JSWSTEEL-EQ", "NSE:BAJAJFINSV-EQ", "NSE:BEL-EQ", "NSE:ETERNAL-EQ", "NSE:POWERGRID-EQ",
+        "NSE:COALINDIA-EQ", "NSE:ASIANPAINT-EQ", "NSE:SHRIRAMFIN-EQ", "NSE:TATASTEEL-EQ", "NSE:HINDALCO-EQ",
+        "NSE:GRASIM-EQ", "NSE:EICHERMOT-EQ", "NSE:INDIGO-EQ", "NSE:SBILIFE-EQ", "NSE:WIPRO-EQ",
+        "NSE:JIOFIN-EQ", "NSE:TRENT-EQ", "NSE:TECHM-EQ", "NSE:APOLLOHOSP-EQ", "NSE:HDFCLIFE-EQ",
+        "NSE:TMPV-EQ", "NSE:CIPLA-EQ", "NSE:TATACONSUM-EQ", "NSE:MAXHEALTH-EQ", "NSE:DRREDDY-EQ",
+        "NSE:NESTLEIND-EQ"
+    ]
+    if fyers_socket:
+        fyers_socket.subscribe(symbols=symbols, data_type="SymbolUpdate")
+        fyers_socket.keep_running()
+
+def on_close(message):
+    print(f"Fyers Live Market Data Socket connection closed: {message}")
+
+def on_error(message):
+    print(f"Fyers Live Market Data Socket connection error: {message}")
+
+def on_message(message):
+    global main_loop
+    # Route tick to connected Rust WebSocket clients
+    symbol = message.get("symbol")
+    price = message.get("ltp")
+    volume = message.get("vol_tradedtoday", 0)
+    oi = message.get("oi", 0)
+
+    if main_loop and symbol and price:
+        tick_data = {
+            "symbol": symbol,
+            "price": float(price),
+            "volume": int(volume),
+            "oi": int(oi),
+            "timestamp": int(time.time())
+        }
+        # Run async send thread-safely in the main asyncio loop
+        for ws in list(connected_ws):
+            asyncio.run_coroutine_threadsafe(ws.send_json(tick_data), main_loop)
+
+def start_fyers_socket(client_id: str, token: str):
+    global fyers_socket
+    access_token = f"{client_id}:{token}"
+    
+    fyers_socket = data_ws.FyersDataSocket(
+        access_token=access_token,
+        litemode=False,
+        write_to_file=False,
+        reconnect=True,
+        on_connect=on_open,
+        on_close=on_close,
+        on_error=on_error,
+        on_message=on_message
+    )
+    
+    t = threading.Thread(target=fyers_socket.connect, daemon=True)
+    t.start()
+    print("Fyers Data Websocket service started in background thread.")
+
 @app.on_event("startup")
 def startup_event():
-    global fyers_client
+    global fyers_client, main_loop
+    main_loop = asyncio.get_running_loop()
+    init_db()
+
     client_id = os.environ.get("FYERS_CLIENT_ID")
     
     # Read persisted token if available
@@ -76,6 +181,9 @@ def startup_event():
                 log_path=os.getcwd()
             )
             print("Successfully initialized Fyers client from token.")
+            
+            # Start Live Market Feed WebSockets
+            start_fyers_socket(client_id, token)
         except Exception as e:
             print(f"Error initializing Fyers API client: {e}")
             fyers_client = None
@@ -89,6 +197,31 @@ def get_client() -> fyersModel.FyersModel:
             detail="Fyers API Client is not initialized. Ensure FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN are set."
         )
     return fyers_client
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    connected_ws.append(websocket)
+    print(f"Rust Client subscribed to data stream. Active clients: {len(connected_ws)}")
+    try:
+        while True:
+            # Keep client alive
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        connected_ws.remove(websocket)
+        print(f"Rust Client disconnected. Active clients: {len(connected_ws)}")
+
+@app.post("/subscribe")
+def subscribe(req: SubscribeRequest):
+    if fyers_socket:
+        try:
+            fyers_socket.subscribe(symbols=req.symbols, data_type="SymbolUpdate")
+            print(f"Successfully subscribed to: {req.symbols}")
+            return {"status": "success", "subscribed": req.symbols}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        raise HTTPException(status_code=503, detail="Fyers WebSocket not connected")
 
 @app.get("/auth_url")
 def get_auth_url():
@@ -145,6 +278,8 @@ def login_token(req: TokenRequest):
             with open(token_file_path, "w") as f:
                 f.write(access_token)
                 
+            # Start websocket client
+            start_fyers_socket(client_id, access_token)
             return {"status": "success", "access_token": access_token}
         else:
             raise HTTPException(status_code=400, detail=res.get("message", "Token generation failed"))
@@ -166,7 +301,6 @@ def login():
 
 @app.post("/logout")
 def logout():
-    # Remove persisted token to log out
     token_file_path = os.path.join(os.getcwd(), "token.txt")
     if os.path.exists(token_file_path):
         try:
@@ -429,18 +563,63 @@ def get_quotes(symbols: List[str]):
 @app.post("/history")
 def get_history(req: HistoryRequest):
     fyers = get_client()
+    
+    # 1. Try to check local SQLite database cache first
+    cached_candles = []
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        # Simple date checks (dates formatted as yyyy-mm-dd can be converted to epochs)
+        import datetime
+        epoch_from = int(datetime.datetime.strptime(req.range_from, "%Y-%m-%d").timestamp())
+        epoch_to = int(datetime.datetime.strptime(req.range_to, "%Y-%m-%d").timestamp())
+        
+        cursor.execute(
+            "SELECT timestamp, open, high, low, close, volume FROM historical_candles WHERE symbol = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC",
+            (req.symbol, epoch_from, epoch_to)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        
+        # If we have enough cached data, return it
+        if len(rows) > 0:
+            print(f"Retrieved {len(rows)} cached candles from SQLite for {req.symbol}")
+            for r in rows:
+                cached_candles.append([r[0], r[1], r[2], r[3], r[4], r[5]])
+            return {"status": "success", "data": {"candles": cached_candles}}
+    except Exception as e:
+        print(f"SQLite reading cache failed: {e}")
+
+    # 2. Cache miss: Query Fyers API
     try:
         data = {
             "symbol": req.symbol,
             "resolution": req.resolution,
-            "date_format": req.date_format,
+            "date_format": "0",  # Always fetch with Epoch Timestamp to keep DB cache standard
             "range_from": req.range_from,
             "range_to": req.range_to,
             "cont_flag": "1"
         }
         res = fyers.history(data=data)
         if res.get("s") == "ok":
-            return {"status": "success", "data": {"candles": res.get("candles", [])}}
+            candles = res.get("candles", [])
+            # Write to SQLite Cache asynchronously
+            if len(candles) > 0:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    for c in candles:
+                        # c: [timestamp, open, high, low, close, volume]
+                        cursor.execute(
+                            "INSERT OR REPLACE INTO historical_candles (symbol, timestamp, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (req.symbol, int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), int(c[5]))
+                        )
+                    conn.commit()
+                    conn.close()
+                    print(f"Cached {len(candles)} new candles in SQLite database for {req.symbol}")
+                except Exception as e:
+                    print(f"SQLite writing cache failed: {e}")
+            return {"status": "success", "data": {"candles": candles}}
         else:
             raise HTTPException(status_code=400, detail=res.get("message", "Fyers history check failed"))
     except Exception as e:

@@ -101,6 +101,14 @@ impl ExecutionOrchestrator {
         if let Some(ref mut pos) = self.active_position {
             self.hold_minutes += 1;
             
+            // In options longing, we track the price of the option contract to evaluate exits
+            let mut check_price = tick.price;
+            if let Ok(quotes) = self.broker.quotes(vec![pos.symbol.clone()]).await {
+                if let Some(q) = quotes.first() {
+                    check_price = q.last_price;
+                }
+            }
+
             // Evaluate Exit signals from WMA Geometry & Market indicators dynamically
             let momentum_weakened = geometry.slope < 0.0; 
             let geometry_contracted = geometry.compression > 0.0;
@@ -108,7 +116,7 @@ impl ExecutionOrchestrator {
 
             // Check for exit
             let should_exit = self.exit_evaluator.should_exit(
-                tick.price,
+                check_price,
                 self.entry_price,
                 self.target_price,
                 self.stop_price,
@@ -123,32 +131,28 @@ impl ExecutionOrchestrator {
             if let Some(reason) = should_exit {
                 info!("Exit condition met: {:?}", reason);
                 
-                // Route close order
+                // Route close order (SELL to close active options position)
                 let exit_request = OrderRequest {
-                    symbol: tick.symbol.clone(),
+                    symbol: pos.symbol.clone(),
                     qty: pos.buy_qty.max(pos.sell_qty),
                     r#type: 2, // Market order to exit fast
-                    side: if pos.side == Side::Buy { Side::Sell } else { Side::Buy },
+                    side: Side::Sell, // Sell to close the Long Option
                     limit_price: 0.0,
                     stop_price: 0.0,
                 };
 
                 match self.broker.place_order(exit_request).await {
                     Ok(resp) => {
-                        let exit_price = tick.price;
-                        let pnl = if pos.side == Side::Buy {
-                            (exit_price - self.entry_price) * (pos.buy_qty as f64)
-                        } else {
-                            (self.entry_price - exit_price) * (pos.sell_qty as f64)
-                        };
+                        let exit_price = check_price;
+                        let pnl = (exit_price - self.entry_price) * (pos.buy_qty as f64);
 
-                        info!("Exit order filled: {}. PnL: {}", resp.order_id, pnl);
+                        info!("Exit order filled for option {}: {}. PnL: {}", pos.symbol, resp.order_id, pnl);
                         
                         // Update Risk stats
                         self.risk_engine.record_trade_exit(pnl);
 
                         events.push(EngineEvent::PositionClosed {
-                            symbol: tick.symbol.clone(),
+                            symbol: pos.symbol.clone(),
                             qty: pos.buy_qty.max(pos.sell_qty),
                             exit_price,
                             pnl,
@@ -199,17 +203,35 @@ impl ExecutionOrchestrator {
             );
 
             if decision == Decision::Trade {
-                info!("Strategy triggered buy signal at price {}. Trade Quality Score: {:.2}", tick.price, quality.total);
+                info!("Strategy triggered entry signal. Trade Quality Score: {:.2}", quality.total);
                 
                 if quality.total < self.opportunity_engine.quality_threshold {
                     warn!("Trade candidate rejected due to insufficient Quality Score: {:.2} < {:.2}", 
                         quality.total, self.opportunity_engine.quality_threshold);
                 } else {
+                    // Determine which option symbol to buy: Call (CE) for bullish, Put (PE) for bearish
+                    let is_bullish = geometry.slope >= 0.0;
+                    let target_symbol = if is_bullish {
+                        std::env::var("ACTIVE_CE_SYMBOL").unwrap_or_else(|_| "NSE:NIFTY2673024100CE".to_string())
+                    } else {
+                        std::env::var("ACTIVE_PE_SYMBOL").unwrap_or_else(|_| "NSE:NIFTY2673024100PE".to_string())
+                    };
+
+                    info!("Selected target option: {} (Bullish: {})", target_symbol, is_bullish);
+
+                    // Fetch the latest quote of the target option contract to calculate accurate pricing
+                    let mut option_price = tick.price;
+                    if let Ok(quotes) = self.broker.quotes(vec![target_symbol.clone()]).await {
+                        if let Some(q) = quotes.first() {
+                            option_price = q.last_price;
+                        }
+                    }
+
                     events.push(EngineEvent::TradeCandidate {
-                        symbol: tick.symbol.clone(),
-                        side: 1, // Buy side
+                        symbol: target_symbol.clone(),
+                        side: 1, // Always Buying (Longing) Options
                         confidence: opportunity.confidence,
-                        price: tick.price,
+                        price: option_price,
                     });
 
                     // 9. Dynamic Sizing using the Capital Engine (Kelly Criterion)
@@ -220,21 +242,21 @@ impl ExecutionOrchestrator {
                         3.0,  // Reward-risk ratio
                         self.current_atr * self.exit_evaluator.risk_multiplier, // Stop loss distance
                         0.5,  // Half-Kelly fraction for risk buffer
-                        tick.price,
+                        option_price,
                     );
 
                     if qty == 0 {
                         warn!("Kelly Position Size calculated as 0. Skipping trade entry.");
                     } else {
-                        info!("Kelly Position Sizing allocated quantity: {} (Available balance: {:.2})", qty, funds.available_balance);
+                        info!("Kelly Position Sizing allocated quantity: {} for option {} (Available balance: {:.2})", qty, target_symbol, funds.available_balance);
 
                         // Check Risk Engine limits
                         let order_request = OrderRequest {
-                            symbol: tick.symbol.clone(),
+                            symbol: target_symbol.clone(),
                             qty,
                             r#type: 1, // Limit Order
-                            side: Side::Buy,
-                            limit_price: tick.price,
+                            side: Side::Buy, // Always Buy to Open Option Long position
+                            limit_price: option_price,
                             stop_price: 0.0,
                         };
 
@@ -243,49 +265,49 @@ impl ExecutionOrchestrator {
                                 info!("Risk approved order request");
                                 events.push(EngineEvent::RiskApproved {
                                     order_id: "pending-risk-id".to_string(),
-                                    allocated_capital: tick.price * (qty as f64),
+                                    allocated_capital: option_price * (qty as f64),
                                 });
 
                                 // Place the order
                                 match self.broker.place_order(order_request).await {
                                     Ok(resp) => {
-                                        info!("Entry order placed successfully: {}", resp.order_id);
+                                        info!("Option entry order placed successfully: {}", resp.order_id);
                                         events.push(EngineEvent::OrderPlaced {
                                             order_id: resp.order_id.clone(),
-                                            symbol: tick.symbol.clone(),
+                                            symbol: target_symbol.clone(),
                                             qty,
-                                            price: tick.price,
+                                            price: option_price,
                                         });
 
                                         // In mock/paper broker, this completes immediately.
                                         events.push(EngineEvent::OrderFilled {
                                             order_id: resp.order_id.clone(),
-                                            fill_price: tick.price,
+                                            fill_price: option_price,
                                             qty,
                                         });
 
-                                        let (target, stop) = self.exit_evaluator.calculate_targets(self.current_atr, tick.price, 1);
-                                        info!("Calculated targets -> Target: {}, SL: {}", target, stop);
+                                        let (target, stop) = self.exit_evaluator.calculate_targets(self.current_atr, option_price, 1);
+                                        info!("Calculated option targets -> Target: {}, SL: {}", target, stop);
 
                                         self.active_position = Some(Position {
-                                            symbol: tick.symbol.clone(),
-                                            side: Side::Buy,
+                                            symbol: target_symbol.clone(),
+                                            side: Side::Buy, // Long
                                             buy_qty: qty,
                                             sell_qty: 0,
-                                            avg_price: tick.price,
-                                            current_price: tick.price,
+                                            avg_price: option_price,
+                                            current_price: option_price,
                                             pnl: 0.0,
                                         });
 
-                                        self.entry_price = tick.price;
+                                        self.entry_price = option_price;
                                         self.target_price = target;
                                         self.stop_price = stop;
                                         self.hold_minutes = 0;
 
                                         events.push(EngineEvent::PositionOpened {
-                                            symbol: tick.symbol.clone(),
+                                            symbol: target_symbol.clone(),
                                             qty,
-                                            avg_price: tick.price,
+                                            avg_price: option_price,
                                         });
                                     }
                                     Err(e) => {
