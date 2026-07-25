@@ -1,0 +1,7 @@
+/target/
+/.env
+/python-broker/venv/
+/python-broker/token.txt
+/python-broker/__pycache__/
+*.log
+/crates/price-broker/token.txt

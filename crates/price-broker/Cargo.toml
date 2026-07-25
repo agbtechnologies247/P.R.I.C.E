@@ -1,0 +1,17 @@
+[package]
+name = "price-broker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+price-core = { path = "../price-core" }
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+rust_decimal.workspace = true
+dashmap.workspace = true
+uuid.workspace = true

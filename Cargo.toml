@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/price-core",
+    "crates/price-broker",
+    "crates/price-indicators",
+    "crates/price-strategy",
+    "crates/price-risk",
+    "crates/price-execution",
+    "apps/price-worker",
+    "apps/price-server"
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+futures = "0.3"
+dashmap = "6"
+governor = "0.8"
+rust_decimal = { version = "1", features = ["serde"] }
+dotenvy = "0.15"

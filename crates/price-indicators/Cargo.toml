@@ -1,0 +1,9 @@
+[package]
+name = "price-indicators"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+price-core = { path = "../price-core" }
+serde.workspace = true
+chrono.workspace = true

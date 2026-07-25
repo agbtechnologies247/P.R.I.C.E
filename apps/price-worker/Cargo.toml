@@ -1,0 +1,18 @@
+[package]
+name = "price-worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+price-core = { path = "../../crates/price-core" }
+price-broker = { path = "../../crates/price-broker" }
+price-indicators = { path = "../../crates/price-indicators" }
+price-strategy = { path = "../../crates/price-strategy" }
+price-risk = { path = "../../crates/price-risk" }
+price-execution = { path = "../../crates/price-execution" }
+tokio.workspace = true
+serde.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy.workspace = true

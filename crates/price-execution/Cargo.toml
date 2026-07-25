@@ -1,0 +1,16 @@
+[package]
+name = "price-execution"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+price-core = { path = "../price-core" }
+price-broker = { path = "../price-broker" }
+price-indicators = { path = "../price-indicators" }
+price-strategy = { path = "../price-strategy" }
+price-risk = { path = "../price-risk" }
+tokio.workspace = true
+serde.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+async-trait.workspace = true

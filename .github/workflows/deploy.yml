@@ -1,0 +1,52 @@
+name: Build and Deploy P.R.I.C.E
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Check Rust Compilation
+      run: cargo check
+
+    - name: SSH Deploy to VPS
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.VPS_IP }}
+        username: ${{ secrets.VPS_USER }}
+        key: ${{ secrets.VPS_SSH_KEY }}
+        port: 22
+        script: |
+          mkdir -p /root/projects
+          if [ ! -d "/root/projects/P.R.I.C.E" ]; then
+              echo "Cloning repository..."
+              git clone https://github.com/agbtechnologies247/P.R.I.C.E.git /root/projects/P.R.I.C.E
+          fi
+          cd /root/projects/P.R.I.C.E
+          echo "Syncing code with GitHub main branch..."
+          git fetch origin
+          git reset --hard origin/main
+          
+          # Copy the .env file from /root if it's stored there, or create basic configuration if missing
+          if [ ! -f ".env" ]; then
+              if [ -f "/root/P.R.I.C.E.env" ]; then
+                  cp /root/P.R.I.C.E.env .env
+              else
+                  echo "Creating default environment file..."
+                  echo "RUST_LOG=info" > .env
+                  echo "PYTHON_BROKER_URL=http://127.0.0.1:8001" >> .env
+              fi
+          fi
+          
+          echo "Running deployment script..."
+          bash deploy.sh

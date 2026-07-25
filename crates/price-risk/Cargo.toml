@@ -1,0 +1,9 @@
+[package]
+name = "price-risk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+price-core = { path = "../price-core" }
+price-broker = { path = "../price-broker" }
+serde.workspace = true

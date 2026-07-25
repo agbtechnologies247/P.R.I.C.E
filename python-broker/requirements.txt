@@ -1,0 +1,7 @@
+fyers-apiv3
+fastapi
+uvicorn
+pydantic
+requests
+websockets
+orjson

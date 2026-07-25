@@ -1,0 +1,10 @@
+[package]
+name = "price-strategy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+price-core = { path = "../price-core" }
+price-indicators = { path = "../price-indicators" }
+serde.workspace = true
+chrono.workspace = true
