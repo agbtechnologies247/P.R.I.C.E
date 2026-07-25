@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn index_handler() -> Html<&'static str> {
-    Html(r#"
+    Html(r##"
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -567,7 +567,7 @@ async fn index_handler() -> Html<&'static str> {
     </script>
 </body>
 </html>
-    "#)
+"##)
 }
 
 async fn health_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serde_json::Value> {
