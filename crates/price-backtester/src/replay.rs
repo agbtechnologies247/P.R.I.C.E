@@ -257,3 +257,63 @@ impl ReplayRunner {
         Ok(report)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use price_core::Candle;
+    use chrono::{Utc, TimeZone, NaiveDate};
+
+    #[tokio::test]
+    async fn test_backtest_runner_integration() {
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5433/price".to_string());
+        
+        let client = match TimescaleClient::new(&db_url).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        if client.init_db().await.is_err() {
+            return;
+        }
+
+        let date = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        let base_time = Utc.with_ymd_and_hms(2026, 7, 24, 9, 15, 0).unwrap();
+        
+        let mut spot_candles = Vec::new();
+        let mut vix_candles = Vec::new();
+        
+        for m in 0..30 {
+            let ts = base_time + chrono::Duration::minutes(m);
+            let price = 24000.0 + (m as f64) * 5.0;
+            spot_candles.push(Candle {
+                timestamp: ts,
+                open: price - 2.0,
+                high: price + 3.0,
+                low: price - 3.0,
+                close: price,
+                volume: 6000,
+            });
+            vix_candles.push(Candle {
+                timestamp: ts,
+                open: 15.0,
+                high: 15.2,
+                low: 14.8,
+                close: 15.0,
+                volume: 0,
+            });
+        }
+
+        let _ = client.insert_candles("NSE:NIFTY50-INDEX", "NSE", "1m", &spot_candles).await;
+        let _ = client.insert_candles("NSE:INDIAVIX-INDEX", "NSE", "1m", &vix_candles).await;
+
+        let runner = ReplayRunner::new(client);
+        let output_dir = "./target/debug/test_results";
+        let res = runner.run_backtest("NSE:NIFTY50-INDEX", date, date, 100000.0, output_dir).await;
+        
+        assert!(res.is_ok(), "Backtest run failed: {:?}", res.err());
+        let report = res.unwrap();
+        assert!(report.final_equity > 0.0);
+    }
+}
