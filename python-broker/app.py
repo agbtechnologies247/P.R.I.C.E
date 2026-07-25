@@ -89,6 +89,7 @@ def on_open():
     # Standard initial symbols (Nifty index + 50 constituents)
     symbols = [
         "NSE:NIFTY50-INDEX",
+        "NSE:INDIAVIX-INDEX",
         "NSE:RELIANCE-EQ", "NSE:BHARTIARTL-EQ", "NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ",
         "NSE:SBIN-EQ", "NSE:TCS-EQ", "NSE:BAJFINANCE-EQ", "NSE:LT-EQ", "NSE:HINDUNILVR-EQ",
         "NSE:SUNPHARMA-EQ", "NSE:MARUTI-EQ", "NSE:INFY-EQ", "NSE:TITAN-EQ", "NSE:ADANIENT-EQ",

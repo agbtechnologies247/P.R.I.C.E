@@ -47,7 +47,7 @@ impl ExitEvaluator {
     pub fn should_exit(
         &self,
         current_price: f64,
-        entry_price: f64,
+        _entry_price: f64,
         target_price: f64,
         stop_price: f64,
         side: i8,

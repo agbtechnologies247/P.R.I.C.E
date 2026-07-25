@@ -77,23 +77,23 @@ impl RiskEngine {
 
         let budget = available_balance * kelly_fraction * fractional_kelly;
         
-        // Assume contract multiplier is 15 (lot size of BankNifty options)
-        let lot_size = 15.0;
+        // Contract multiplier is 65 (lot size of Nifty options)
+        let lot_size = 65.0;
         let cost_per_point_loss = lot_size * stop_loss_points;
         
         let lots = (budget / cost_per_point_loss).floor() as i32;
-        let mut qty = lots * 15;
+        let mut qty = lots * 65;
         
         // Cap by available balance (margin limit)
         let cost = qty as f64 * entry_price;
         if cost > available_balance && entry_price > 0.0 {
             let max_possible_qty = (available_balance / entry_price).floor() as i32;
-            let max_possible_lots = max_possible_qty / 15;
-            qty = max_possible_lots * 15;
+            let max_possible_lots = max_possible_qty / 65;
+            qty = max_possible_lots * 65;
         }
 
-        // Return quantity within safe bounds (minimum 15 options, maximum 300)
-        qty.max(15).min(300)
+        // Return quantity within safe bounds (minimum 65 options, maximum 1300)
+        qty.max(65).min(1300)
     }
 
     pub fn record_trade_exit(&mut self, pnl: f64) {
@@ -120,11 +120,11 @@ mod tests {
             3.0,     // reward_risk_ratio
             10.0,    // stop_loss_points
             0.5,     // fractional_kelly (Half-Kelly)
-            5.0,     // entry_price (cost = 225 * 5 = 1125 <= 10000)
+            5.0,     // entry_price
         );
         
-        // Expected lots = floor((10000 * 0.46666 * 0.5) / 150.0) = 15 lots -> 225 qty
-        assert_eq!(qty, 225);
+        // Expected lots = floor((10000 * 0.46666 * 0.5) / 650.0) = 3 lots -> 195 qty
+        assert_eq!(qty, 195);
     }
 
     #[test]
@@ -151,8 +151,8 @@ mod tests {
             3.0,
             10.0,
             0.5,
-            50.0, // entry_price (cost = 225 * 50 = 11250 > 10000) -> should cap to max lots possible = floor(10000 / 50) = 200 -> max lots 13 * 15 = 195 qty
+            100.0, // entry_price (uncapped cost = 195 * 100 = 19500 > 10000) -> should cap to max lots possible = floor(10000 / 100) = 100 -> max lots = 1 -> 65 qty
         );
-        assert_eq!(qty, 195);
+        assert_eq!(qty, 65);
     }
 }

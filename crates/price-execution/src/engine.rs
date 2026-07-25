@@ -21,6 +21,10 @@ pub struct ExecutionOrchestrator {
     
     // Live Indicators
     current_atr: f64,
+    current_vix: f64,
+    current_spread: f64,
+    current_ml_confidence: f64,
+    current_nifty_spot: f64,
     
     // Active trade tracking
     active_position: Option<Position>,
@@ -48,6 +52,10 @@ impl ExecutionOrchestrator {
             atr_calc: AtrCalculator::new(14),
             price_history: Vec::new(),
             current_atr: 12.0,
+            current_vix: 15.0,
+            current_spread: 0.20,
+            current_ml_confidence: 75.0,
+            current_nifty_spot: 24100.0,
             active_position: None,
             entry_price: 0.0,
             target_price: 0.0,
@@ -56,8 +64,28 @@ impl ExecutionOrchestrator {
         }
     }
 
+    pub fn update_weighted_delta(&mut self, delta: f64) {
+        // Map delta to an ML confidence score proxy from 0.0 to 100.0
+        // e.g. delta of 0.0 -> 50.0. delta of +0.5% -> 100.0, delta of -0.5% -> 0.0
+        let mapped = (50.0 + delta * 10000.0).max(0.0).min(100.0);
+        self.current_ml_confidence = mapped;
+        debug!("Weighted delta updated: {:.6} -> ML confidence proxy: {:.2}", delta, mapped);
+    }
+
     pub async fn ingest_tick(&mut self, tick: TickData) -> Result<Vec<EngineEvent>> {
         let mut events = vec![EngineEvent::TickReceived(tick.clone())];
+        
+        // Update India VIX state if the tick is VIX
+        if tick.symbol == "NSE:INDIAVIX-INDEX" {
+            self.current_vix = tick.price;
+            debug!("Live India VIX updated to: {:.2}", self.current_vix);
+            return Ok(events);
+        }
+
+        // Update Nifty spot price if index tick is received
+        if tick.symbol == "NSE:NIFTY50-INDEX" {
+            self.current_nifty_spot = tick.price;
+        }
         
         // 1. Update Candle Aggregator
         if let Some(closed_candle) = self.candle_aggregator.ingest_tick(&tick) {
@@ -94,7 +122,7 @@ impl ExecutionOrchestrator {
             vwap: current_vwap,
             atr: self.current_atr,
             adx: 25.0,
-            spread: 0.20,
+            spread: self.current_spread,
         });
 
         // 6. Check if we already have an active position
@@ -106,6 +134,8 @@ impl ExecutionOrchestrator {
             if let Ok(quotes) = self.broker.quotes(vec![pos.symbol.clone()]).await {
                 if let Some(q) = quotes.first() {
                     check_price = q.last_price;
+                    // Update spread dynamically from active option quotes
+                    self.current_spread = (q.ask - q.bid).abs().max(0.05);
                 }
             }
 
@@ -175,16 +205,15 @@ impl ExecutionOrchestrator {
             // 7. Evaluates Entry rules
             let oi_increasing = tick.volume > 5000; 
             let volume_spike = tick.volume > 10000;
-            let ml_prediction = 90.0; // 90% confidence from ML model
 
             let (opportunity, decision) = self.opportunity_engine.evaluate_entry(
                 tick.price,
                 current_vwap,
-                14.5, // India VIX
+                self.current_vix,
                 oi_increasing,
                 volume_spike,
                 &geometry,
-                ml_prediction,
+                self.current_ml_confidence,
             );
 
             events.push(EngineEvent::ConfidenceUpdated {
@@ -193,8 +222,8 @@ impl ExecutionOrchestrator {
 
             // 8. Evaluate Trade Quality Score
             let quality = self.opportunity_engine.calculate_quality_score(
-                14.5, // VIX
-                0.20, // Spread
+                self.current_vix,
+                self.current_spread,
                 &geometry,
                 oi_increasing,
                 0.10, // Slippage
@@ -211,19 +240,27 @@ impl ExecutionOrchestrator {
                 } else {
                     // Determine which option symbol to buy: Call (CE) for bullish, Put (PE) for bearish
                     let is_bullish = geometry.slope >= 0.0;
+                    
+                    // Dynamic Strike calculation: round Nifty spot to nearest 50 strikes
+                    let strike = (self.current_nifty_spot / 50.0).round() * 50.0;
+                    let prefix = std::env::var("ACTIVE_EXPIRY_PREFIX").unwrap_or_else(|_| "NSE:NIFTY26730".to_string());
+                    
                     let target_symbol = if is_bullish {
-                        std::env::var("ACTIVE_CE_SYMBOL").unwrap_or_else(|_| "NSE:NIFTY2673024100CE".to_string())
+                        format!("{}{:.0}CE", prefix, strike)
                     } else {
-                        std::env::var("ACTIVE_PE_SYMBOL").unwrap_or_else(|_| "NSE:NIFTY2673024100PE".to_string())
+                        format!("{}{:.0}PE", prefix, strike)
                     };
 
-                    info!("Selected target option: {} (Bullish: {})", target_symbol, is_bullish);
+                    info!("Selected dynamic target option: {} (Nifty Spot: {:.2}, Strike: {:.0}, Bullish: {})", 
+                        target_symbol, self.current_nifty_spot, strike, is_bullish);
 
                     // Fetch the latest quote of the target option contract to calculate accurate pricing
                     let mut option_price = tick.price;
                     if let Ok(quotes) = self.broker.quotes(vec![target_symbol.clone()]).await {
                         if let Some(q) = quotes.first() {
                             option_price = q.last_price;
+                            // Update spread dynamically
+                            self.current_spread = (q.ask - q.bid).abs().max(0.05);
                         }
                     }
 

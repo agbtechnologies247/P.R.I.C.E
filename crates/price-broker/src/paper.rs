@@ -216,7 +216,7 @@ impl Broker for PaperBroker {
         Ok(quotes)
     }
 
-    async fn history(&self, request: HistoryRequest) -> Result<CandleSeries> {
+    async fn history(&self, _request: HistoryRequest) -> Result<CandleSeries> {
         // Return 100 dummy minutes
         let mut candles = Vec::new();
         let now_ts = Utc::now().timestamp() as f64;

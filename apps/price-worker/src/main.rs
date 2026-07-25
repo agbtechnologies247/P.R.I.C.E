@@ -46,8 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "3".to_string())
         .parse::<i32>()?;
 
-    let ce_symbol = std::env::var("ACTIVE_CE_SYMBOL").unwrap_or_else(|_| "NSE:NIFTY2673024100CE".to_string());
-    let pe_symbol = std::env::var("ACTIVE_PE_SYMBOL").unwrap_or_else(|_| "NSE:NIFTY2673024100PE".to_string());
+    let expiry_prefix = std::env::var("ACTIVE_EXPIRY_PREFIX").unwrap_or_else(|_| "NSE:NIFTY26730".to_string());
 
     // 3. Setup Broker abstraction
     let broker: Arc<dyn Broker> = if use_simulated {
@@ -180,17 +179,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Subscribe to our active options contracts
-        info!("Subscribing to active Call ({}) and Put ({}) option contracts...", ce_symbol, pe_symbol);
-        let sub_res = http_client.post(&format!("{}/subscribe", python_broker_url))
-            .json(&serde_json::json!({
-                "symbols": vec![ce_symbol.clone(), pe_symbol.clone()]
-            }))
-            .send()
-            .await;
-        if let Err(e) = sub_res {
-            warn!("Failed to subscribe options: {:?}", e);
-        }
+        // Active Option symbols tracking (strike-based)
+        let mut last_subscribed_strike: Option<f64> = None;
 
         // Connect to local python-broker websocket
         let ws_url = python_broker_url.replace("http://", "ws://") + "/ws";
@@ -231,12 +221,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     }
                                                 }
                                             }
+                                            orchestrator.update_weighted_delta(weighted_delta);
                                             debug!("Stock constituent tick: {}. Price: {}. New Weighted Delta: {:.6}", 
                                                 ws_tick.symbol, ws_tick.price, weighted_delta);
                                         }
 
-                                        // 2. Process Nifty Index and Option ticks to pipe to Execution Orchestrator
-                                        if ws_tick.symbol == "NSE:NIFTY50-INDEX" || ws_tick.symbol == ce_symbol || ws_tick.symbol == pe_symbol {
+                                        // 2. Perform Dynamic Strike subscription adjustments
+                                        if ws_tick.symbol == "NSE:NIFTY50-INDEX" {
+                                            let strike = (ws_tick.price / 50.0).round() * 50.0;
+                                            if last_subscribed_strike != Some(strike) {
+                                                let new_ce = format!("{}{:.0}CE", expiry_prefix, strike);
+                                                let new_pe = format!("{}{:.0}PE", expiry_prefix, strike);
+                                                
+                                                let client_clone = http_client.clone();
+                                                let url_clone = python_broker_url.clone();
+                                                
+                                                tokio::spawn(async move {
+                                                    info!("ATM Strike shift detected! Dynamically subscribing to: CE={}, PE={}", new_ce, new_pe);
+                                                    let _ = client_clone.post(&format!("{}/subscribe", url_clone))
+                                                        .json(&serde_json::json!({
+                                                            "symbols": vec![new_ce, new_pe]
+                                                        }))
+                                                        .send()
+                                                        .await;
+                                                });
+                                                
+                                                last_subscribed_strike = Some(strike);
+                                            }
+                                        }
+
+                                        // 3. Filter and pipe active option contracts + index/VIX ticks to Orchestrator
+                                        let is_active_option = if let Some(strike) = last_subscribed_strike {
+                                            let active_ce = format!("{}{:.0}CE", expiry_prefix, strike);
+                                            let active_pe = format!("{}{:.0}PE", expiry_prefix, strike);
+                                            ws_tick.symbol == active_ce || ws_tick.symbol == active_pe
+                                        } else {
+                                            false
+                                        };
+
+                                        if ws_tick.symbol == "NSE:NIFTY50-INDEX" || ws_tick.symbol == "NSE:INDIAVIX-INDEX" || is_active_option {
                                             let tick = TickData {
                                                 symbol: ws_tick.symbol.clone(),
                                                 price: ws_tick.price,
