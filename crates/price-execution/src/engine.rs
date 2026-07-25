@@ -4,7 +4,7 @@ use chrono::Utc;
 use tracing::{info, warn, error, debug};
 use price_core::{TickData, Candle, EngineEvent, Result, PriceError};
 use price_broker::{Broker, OrderRequest, Side, Position};
-use price_indicators::{VwapCalculator, GeometryEngine, TrendGeometry};
+use price_indicators::{VwapCalculator, GeometryEngine, TrendGeometry, AtrCalculator, CandleAggregator};
 use price_strategy::{OpportunityEngine, ExitEvaluator, Decision, ExitReason};
 use price_risk::RiskEngine;
 
@@ -15,7 +15,12 @@ pub struct ExecutionOrchestrator {
     exit_evaluator: ExitEvaluator,
     vwap_calc: VwapCalculator,
     geometry_engine: GeometryEngine,
+    candle_aggregator: CandleAggregator,
+    atr_calc: AtrCalculator,
     price_history: Vec<f64>,
+    
+    // Live Indicators
+    current_atr: f64,
     
     // Active trade tracking
     active_position: Option<Position>,
@@ -39,7 +44,10 @@ impl ExecutionOrchestrator {
             exit_evaluator,
             vwap_calc: VwapCalculator::new(),
             geometry_engine: GeometryEngine::new(),
+            candle_aggregator: CandleAggregator::new(),
+            atr_calc: AtrCalculator::new(14),
             price_history: Vec::new(),
+            current_atr: 12.0,
             active_position: None,
             entry_price: 0.0,
             target_price: 0.0,
@@ -51,16 +59,24 @@ impl ExecutionOrchestrator {
     pub async fn ingest_tick(&mut self, tick: TickData) -> Result<Vec<EngineEvent>> {
         let mut events = vec![EngineEvent::TickReceived(tick.clone())];
         
-        // 1. Update VWAP
+        // 1. Update Candle Aggregator
+        if let Some(closed_candle) = self.candle_aggregator.ingest_tick(&tick) {
+            // Update ATR when a candle closes
+            self.current_atr = self.atr_calc.update(closed_candle.clone());
+            info!("Candle closed: {:?}. New ATR: {:.2}", closed_candle, self.current_atr);
+            events.push(EngineEvent::CandleClosed(closed_candle));
+        }
+
+        // 2. Update VWAP
         let current_vwap = self.vwap_calc.update(tick.price, tick.volume);
         
-        // 2. Buffer price for WMA calculations (up to 150 values)
+        // 3. Buffer price for WMA calculations (up to 150 values)
         self.price_history.push(tick.price);
         if self.price_history.len() > 150 {
             self.price_history.remove(0);
         }
 
-        // 3. Compute WMAs (WMA5 to WMA100 = 96 values)
+        // 4. Compute WMAs (WMA5 to WMA100 = 96 values)
         let mut wmas = Vec::with_capacity(96);
         for period in 5..=100 {
             if let Some(wma) = price_indicators::calculate_wma(&self.price_history, period) {
@@ -70,21 +86,26 @@ impl ExecutionOrchestrator {
             }
         }
 
-        // 4. Update Trend Geometry
-        let (geometry, dna) = self.geometry_engine.update(&wmas);
+        // 5. Update Trend Geometry
+        let (geometry, _dna) = self.geometry_engine.update(&wmas);
         
         events.push(EngineEvent::IndicatorsUpdated {
             timestamp: tick.timestamp,
             vwap: current_vwap,
-            atr: 12.0, // Fixed dummy ATR for demo (normally computed from candles)
+            atr: self.current_atr,
             adx: 25.0,
             spread: 0.20,
         });
 
-        // 5. Check if we already have an active position
+        // 6. Check if we already have an active position
         if let Some(ref mut pos) = self.active_position {
             self.hold_minutes += 1;
             
+            // Evaluate Exit signals from WMA Geometry & Market indicators dynamically
+            let momentum_weakened = geometry.slope < 0.0; 
+            let geometry_contracted = geometry.compression > 0.0;
+            let oi_reversing = false; // Placeholder for orderbook reversal signals
+
             // Check for exit
             let should_exit = self.exit_evaluator.should_exit(
                 tick.price,
@@ -94,9 +115,9 @@ impl ExecutionOrchestrator {
                 if pos.side == Side::Buy { 1 } else { -1 },
                 self.hold_minutes,
                 current_vwap,
-                false, // momentum
-                false, // OI reversing
-                false, // geometry contracting
+                momentum_weakened,
+                oi_reversing,
+                geometry_contracted,
             );
 
             if let Some(reason) = should_exit {
@@ -147,7 +168,7 @@ impl ExecutionOrchestrator {
                 }
             }
         } else {
-            // 6. Evaluates Entry rules
+            // 7. Evaluates Entry rules
             let oi_increasing = tick.volume > 5000; 
             let volume_spike = tick.volume > 10000;
             let ml_prediction = 90.0; // 90% confidence from ML model
@@ -166,7 +187,7 @@ impl ExecutionOrchestrator {
                 score: opportunity.confidence,
             });
 
-            // 7. Evaluate Trade Quality Score
+            // 8. Evaluate Trade Quality Score
             let quality = self.opportunity_engine.calculate_quality_score(
                 14.5, // VIX
                 0.20, // Spread
@@ -191,13 +212,13 @@ impl ExecutionOrchestrator {
                         price: tick.price,
                     });
 
-                    // 8. Dynamic Sizing using the Capital Engine (Kelly Criterion)
+                    // 9. Dynamic Sizing using the Capital Engine (Kelly Criterion)
                     let funds = self.broker.funds().await?;
                     let qty = self.risk_engine.calculate_position_size(
                         funds.available_balance,
                         opportunity.probability,
                         3.0,  // Reward-risk ratio
-                        10.0, // Stop loss points
+                        self.current_atr * self.exit_evaluator.risk_multiplier, // Stop loss distance
                         0.5,  // Half-Kelly fraction for risk buffer
                         tick.price,
                     );
@@ -243,7 +264,7 @@ impl ExecutionOrchestrator {
                                             qty,
                                         });
 
-                                        let (target, stop) = self.exit_evaluator.calculate_targets(12.0, tick.price, 1);
+                                        let (target, stop) = self.exit_evaluator.calculate_targets(self.current_atr, tick.price, 1);
                                         info!("Calculated targets -> Target: {}, SL: {}", target, stop);
 
                                         self.active_position = Some(Position {
