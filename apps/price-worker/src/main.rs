@@ -9,7 +9,7 @@ use tracing_subscriber::FmtSubscriber;
 use dotenvy::dotenv;
 
 use price_core::TickData;
-use price_broker::{Broker, PaperBroker, FyersClient};
+use price_broker::Broker;
 use price_risk::RiskEngine;
 use price_strategy::{OpportunityEngine, ExitEvaluator};
 use price_execution::ExecutionOrchestrator;
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Load configurations
     let use_simulated = std::env::var("USE_SIMULATED_FEED")
-        .unwrap_or_else(|_| "true".to_string()) == "true";
+        .unwrap_or_else(|_| "false".to_string()) == "true";
     let python_broker_url = std::env::var("PYTHON_BROKER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
     let daily_loss_limit = std::env::var("DAILY_LOSS_LIMIT")
@@ -47,20 +47,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<i32>()?;
 
 
-    // 3. Setup Broker abstraction
-    let broker: Arc<dyn Broker> = if use_simulated {
-        info!("Using high-fidelity in-memory PaperBroker...");
-        Arc::new(PaperBroker::new(10000.0))
-    } else {
-        info!("Connecting to Python Broker Bridge at {}...", python_broker_url);
-        let client = FyersClient::new(&python_broker_url);
-        // Test connection
-        match client.login().await {
-            Ok(token) => info!("Successfully authenticated via Python Bridge. Token length: {}", token.len()),
-            Err(e) => warn!("Python bridge login failed: {:?}. Proceeding with offline fallback.", e),
-        }
-        Arc::new(client)
-    };
+    // 3. Setup Hybrid Broker (Simultaneous Live & Paper)
+    info!("Initializing HybridBroker (simultaneous Live + Paper trading)...");
+    let broker: Arc<dyn Broker> = Arc::new(price_broker::HybridBroker::new(&python_broker_url, 10000.0));
+    // Test login
+    match broker.login().await {
+        Ok(token) => info!("Successfully authenticated hybrid live client. Token length: {}", token.len()),
+        Err(e) => warn!("Hybrid live client login failed: {:?}. Proceeding with mock/simulated fallbacks.", e),
+    }
 
     // 4. Initialize Engines
     let risk_engine = RiskEngine::new(max_trades, daily_loss_limit);
@@ -194,6 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let (_, mut read) = ws_stream.split();
                     let mut step = 0;
+                    let mut last_status_send = std::time::Instant::now();
+                    let server_url = std::env::var("SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
 
                     while let Some(message) = read.next().await {
                         match message {
@@ -294,6 +290,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 Err(e) => {
                                                     error!("Live ingestion step {} error: {:?}", step, e);
                                                 }
+                                            }
+
+                                            // Send status update to server once per second
+                                            if last_status_send.elapsed() >= Duration::from_millis(1000) {
+                                                last_status_send = std::time::Instant::now();
+                                                
+                                                let (prob, conf) = if let Some(ref opt) = orchestrator.last_opportunity {
+                                                    (opt.probability, opt.confidence)
+                                                } else {
+                                                    (0.0, 0.0)
+                                                };
+                                                
+                                                let decision = format!("{:?}", orchestrator.last_decision.unwrap_or(price_strategy::Decision::Wait));
+                                                let quality = orchestrator.last_quality.as_ref().map(|q| q.total).unwrap_or(0.0);
+                                                let target = orchestrator.last_target_option.clone().unwrap_or_else(|| "--".to_string());
+
+                                                let payload = serde_json::json!({
+                                                    "nifty_price": orchestrator.current_nifty_spot,
+                                                    "vix": orchestrator.current_vix,
+                                                    "ml_confidence": orchestrator.current_ml_confidence,
+                                                    "opportunity_confidence": conf,
+                                                    "opportunity_probability": prob,
+                                                    "decision": decision,
+                                                    "quality_score": quality,
+                                                    "target_option": target,
+                                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                                });
+
+                                                let client_clone = http_client.clone();
+                                                let url_clone = format!("{}/live-status", server_url);
+                                                tokio::spawn(async move {
+                                                    let _ = client_clone.post(&url_clone)
+                                                        .json(&payload)
+                                                        .send()
+                                                        .await;
+                                                });
                                             }
                                         }
 

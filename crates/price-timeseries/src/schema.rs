@@ -40,6 +40,51 @@ pub async fn init_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         let _ = sqlx::query("SELECT create_hypertable('candles', 'timestamp', if_not_exists => TRUE);")
             .execute(pool)
             .await;
+
+        // 1. Configure hypertable compression
+        let _ = sqlx::query(
+            "ALTER TABLE candles SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'symbol, interval'
+            );"
+        )
+        .execute(pool)
+        .await;
+
+        let _ = sqlx::query("SELECT add_compression_policy('candles', INTERVAL '7 days', if_not_exists => TRUE);")
+            .execute(pool)
+            .await;
+
+        // 2. Create 5-minute Continuous Aggregate view
+        let _ = sqlx::query(
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS candles_5m
+             WITH (timescaledb.continuous) AS
+             SELECT
+                 time_bucket('5 minutes', timestamp) AS timestamp,
+                 symbol,
+                 exchange,
+                 '5m'::TEXT AS interval,
+                 first(open, timestamp) AS open,
+                 max(high) AS high,
+                 min(low) AS low,
+                 last(close, timestamp) AS close,
+                 sum(volume) AS volume
+             FROM candles
+             GROUP BY timestamp, symbol, exchange;"
+        )
+        .execute(pool)
+        .await;
+
+        // Add refresh policy for 5m continuous aggregate
+        let _ = sqlx::query(
+            "SELECT add_continuous_aggregate_policy('candles_5m',
+                start_offset => INTERVAL '1 hour',
+                end_offset => INTERVAL '1 minute',
+                schedule_interval => INTERVAL '5 minutes',
+                if_not_exists => TRUE);"
+        )
+        .execute(pool)
+        .await;
     }
 
     // 2. Create download_jobs table

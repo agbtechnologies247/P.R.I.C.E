@@ -5,15 +5,34 @@ use axum::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, Level};
+use tracing::{info, Level, error};
 use tracing_subscriber::FmtSubscriber;
 use dotenvy::dotenv;
+use sqlx::Row;
 
-use price_broker::{Broker, PaperBroker, FyersClient, OrderRequest, Side};
+use price_broker::{Broker, OrderRequest, Side};
+use price_timeseries::TimescaleClient;
+
+use std::sync::RwLock;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct LiveStatusInfo {
+    nifty_price: f64,
+    vix: f64,
+    ml_confidence: f64,
+    opportunity_confidence: f64,
+    opportunity_probability: f64,
+    decision: String,
+    quality_score: f64,
+    target_option: String,
+    timestamp: String,
+}
 
 struct AppState {
-    broker: Arc<dyn Broker>,
+    broker: Arc<price_broker::HybridBroker>,
     python_broker_url: String,
+    db: TimescaleClient,
+    live_status: RwLock<Option<LiveStatusInfo>>,
 }
 
 #[tokio::main]
@@ -25,24 +44,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    info!("Starting PRICE Quantitative Monitoring Server...");
-
-    // 2. Setup broker client
-    let use_simulated = std::env::var("USE_SIMULATED_FEED")
-        .unwrap_or_else(|_| "true".to_string()) == "true";
     let python_broker_url = std::env::var("PYTHON_BROKER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        
-    let broker: Arc<dyn Broker> = if use_simulated {
-        Arc::new(PaperBroker::new(10000.0))
-    } else {
-        Arc::new(FyersClient::new(&python_broker_url))
-    };
+
+    // 2. Setup Hybrid broker client (executing both Live & Paper)
+    let broker = Arc::new(price_broker::HybridBroker::new(&python_broker_url, 10000.0));
+
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5433/price".to_string());
+    let db = TimescaleClient::new(&db_url).await?;
+    db.init_db().await?;
 
     let state = Arc::new(AppState {
         broker,
-        python_broker_url,
+        python_broker_url: python_broker_url.clone(),
+        db: db.clone(),
+        live_status: RwLock::new(None),
     });
+
+    // Start background downloader task
+    start_background_downloader(db.clone(), python_broker_url.clone()).await;
 
     // 3. Build routes
     let app = Router::new()
@@ -54,6 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/order", post(place_order_handler))
         .route("/broker/auth_url", get(auth_url_handler))
         .route("/broker/login_token", post(login_token_handler))
+        .route("/live-status", get(get_live_status_handler).post(post_live_status_handler))
+        .route("/database/jobs", get(database_jobs_handler))
+        .route("/database/candles-preview", get(candles_preview_handler))
+        .route("/database/download-status", get(download_status_handler))
+        .route("/database/start-download", post(start_download_handler))
+        .route("/database/download", get(download_handler))
+        .route("/metrics", get(metrics_handler))
         .layer(Extension(state));
 
     // 4. Run server
@@ -114,6 +142,8 @@ async fn index_handler() -> Html<&'static str> {
             margin-bottom: 2rem;
             border-bottom: 1px solid var(--border-color);
             padding-bottom: 1.5rem;
+            flex-wrap: wrap;
+            gap: 1.5rem;
         }
 
         h1 {
@@ -146,6 +176,27 @@ async fn index_handler() -> Html<&'static str> {
             display: inline-block;
             box-shadow: 0 0 10px var(--success);
         }
+
+        .live-pulse {
+            width: 8px;
+            height: 8px;
+            background-color: var(--success);
+            border-radius: 50%;
+            display: inline-block;
+            box-shadow: 0 0 10px var(--success);
+            animation: pulse-glow 1.5s infinite;
+        }
+
+        @keyframes pulse-glow {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+
+        .badge-trade { background: rgba(16, 185, 129, 0.15); border: 1px solid var(--success); color: var(--success); }
+        .badge-wait { background: rgba(99, 102, 241, 0.15); border: 1px solid var(--primary); color: var(--primary); }
+        .badge-reduce { background: rgba(245, 158, 11, 0.15); border: 1px solid var(--warning); color: var(--warning); }
+        .badge-cancel { background: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); color: var(--danger); }
 
         .grid-container {
             display: grid;
@@ -318,6 +369,21 @@ async fn index_handler() -> Html<&'static str> {
             <h1>P.R.I.C.E</h1>
             <p style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem;">Predictive Risk Intelligence & Capital Engine</p>
         </div>
+
+        <!-- Live Ticker Header -->
+        <div style="display: flex; gap: 2rem; align-items: center; background: rgba(20, 26, 46, 0.8); border: 1px solid var(--border-color); padding: 0.6rem 1.5rem; border-radius: 12px; backdrop-filter: blur(8px); box-shadow: 0 4px 20px rgba(0,0,0,0.2);">
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <span class="live-pulse" id="nifty-pulse-dot" style="background-color: var(--danger); box-shadow: 0 0 10px var(--danger);"></span>
+                <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600; letter-spacing: 0.05em;">NIFTY SPOT:</span>
+                <span style="font-size: 1.15rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--text-main);" id="live-nifty-val">₹0.00</span>
+            </div>
+            <div style="width: 1px; height: 20px; background: var(--border-color);"></div>
+            <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600; letter-spacing: 0.05em;">INDIA VIX:</span>
+                <span style="font-size: 1.15rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--warning);" id="live-vix-val">0.00</span>
+            </div>
+        </div>
+
         <div class="status-badge" id="platform-status-badge">
             <span class="status-dot"></span>
             <span id="platform-status-text">Live Monitoring</span>
@@ -327,20 +393,76 @@ async fn index_handler() -> Html<&'static str> {
     <div class="grid-container">
         <!-- Main Column -->
         <div>
-            <div class="card">
-                <div class="card-title">Portfolio & Account Balance</div>
+            <!-- Live Opportunity Section -->
+            <div class="card" style="border-left: 4px solid var(--primary);">
+                <div class="card-title">
+                    <span>Live Opportunity & Quantitative Decision Engine</span>
+                    <span id="last-update-time" style="font-size: 0.75rem; color: var(--danger); font-weight: 600; letter-spacing: 0.05em; background: rgba(239, 68, 68, 0.1); padding: 0.2rem 0.6rem; border-radius: 4px;">Worker offline</span>
+                </div>
+                <div class="metrics-grid" style="margin-bottom: 1.5rem;">
+                    <div class="metric-card" style="padding: 1rem;">
+                        <div class="metric-label">Target Option Contract</div>
+                        <div class="metric-value highlight" style="font-size: 1.4rem; font-family: 'Space Grotesk', sans-serif;" id="opp-target-option">--</div>
+                    </div>
+                    <div class="metric-card" style="padding: 1rem;">
+                        <div class="metric-label">Engine Decision</div>
+                        <div style="margin-top: 0.4rem; display: flex; justify-content: center;">
+                            <span id="opp-decision-badge" class="status-badge badge-wait" style="display: inline-flex; justify-content: center; width: 120px;">WAIT</span>
+                        </div>
+                    </div>
+                    <div class="metric-card" style="padding: 1rem;">
+                        <div class="metric-label">Trade Quality Score</div>
+                        <div class="metric-value" id="opp-quality-score" style="color: var(--warning);">0.0</div>
+                    </div>
+                </div>
                 <div class="metrics-grid">
-                    <div class="metric-card">
+                    <div class="metric-card" style="padding: 1rem; background: rgba(255,255,255,0.01);">
+                        <div class="metric-label">Opportunity Confidence</div>
+                        <div class="metric-value" id="opp-confidence">0.0%</div>
+                    </div>
+                    <div class="metric-card" style="padding: 1rem; background: rgba(255,255,255,0.01);">
+                        <div class="metric-label">ML Win Probability</div>
+                        <div class="metric-value" id="opp-probability">0.0%</div>
+                    </div>
+                    <div class="metric-card" style="padding: 1rem; background: rgba(255,255,255,0.01);">
+                        <div class="metric-label">ML Confidence Proxy</div>
+                        <div class="metric-value" id="opp-ml-confidence">0.0%</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Portfolio & Account Balance (Dual Engines)</div>
+                
+                <h3 style="font-size: 0.85rem; color: var(--success); margin-bottom: 0.75rem; letter-spacing: 0.05em;">📈 LIVE FYERS ACCOUNT</h3>
+                <div class="metrics-grid" style="margin-bottom: 1.5rem;">
+                    <div class="metric-card" style="padding: 1rem;">
                         <div class="metric-label">Total Capital Limit</div>
-                        <div class="metric-value highlight" id="val-limit">₹0.00</div>
+                        <div class="metric-value highlight" id="live-val-limit">₹0.00</div>
                     </div>
-                    <div class="metric-card">
+                    <div class="metric-card" style="padding: 1rem;">
                         <div class="metric-label">Utilized Margin</div>
-                        <div class="metric-value" id="val-utilized">₹0.00</div>
+                        <div class="metric-value" id="live-val-utilized">₹0.00</div>
                     </div>
-                    <div class="metric-card">
+                    <div class="metric-card" style="padding: 1rem;">
                         <div class="metric-label">Available Balance</div>
-                        <div class="metric-value" id="val-available">₹0.00</div>
+                        <div class="metric-value" id="live-val-available">₹0.00</div>
+                    </div>
+                </div>
+
+                <h3 style="font-size: 0.85rem; color: var(--primary); margin-bottom: 0.75rem; letter-spacing: 0.05em;">🤖 PAPER TRADING ACCOUNT</h3>
+                <div class="metrics-grid">
+                    <div class="metric-card" style="padding: 1rem;">
+                        <div class="metric-label">Total Capital Limit</div>
+                        <div class="metric-value highlight" id="paper-val-limit">₹0.00</div>
+                    </div>
+                    <div class="metric-card" style="padding: 1rem;">
+                        <div class="metric-label">Utilized Margin</div>
+                        <div class="metric-value" id="paper-val-utilized">₹0.00</div>
+                    </div>
+                    <div class="metric-card" style="padding: 1rem;">
+                        <div class="metric-label">Available Balance</div>
+                        <div class="metric-value" id="paper-val-available">₹0.00</div>
                     </div>
                 </div>
             </div>
@@ -390,6 +512,83 @@ async fn index_handler() -> Html<&'static str> {
 
         <!-- Sidebar / Auth Console -->
         <div>
+            <div class="card">
+                <div class="card-title">Historical Data Downloader</div>
+                <div class="form-group" style="margin-bottom: 0.75rem;">
+                    <label for="download-year-select">Select Year</label>
+                    <select id="download-year-select" class="input-text" style="background-color: #121824; border: 1px solid var(--border-color); color: var(--text-main); width: 100%; padding: 0.5rem; border-radius: 4px;">
+                        <option value="2026">2026</option>
+                    </select>
+                </div>
+                <div class="form-group" style="margin-bottom: 0.75rem;">
+                    <label for="download-symbol-input">Select / Enter Symbol</label>
+                    <input list="download-symbols-list" id="download-symbol-input" class="input-text" style="background-color: #121824; border: 1px solid var(--border-color); color: var(--text-main); width: 100%; padding: 0.5rem; border-radius: 4px;" value="NSE:NIFTY50-INDEX" placeholder="e.g. NSE:NIFTY50-INDEX">
+                    <datalist id="download-symbols-list">
+                        <option value="NSE:NIFTY50-INDEX">
+                        <option value="NSE:INDIAVIX-INDEX">
+                    </datalist>
+                </div>
+                <div id="downloader-info-box" style="margin: 1rem 0; padding: 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color);">
+                    <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between; margin-bottom: 0.25rem;">
+                        <span>Status:</span>
+                        <strong id="downloader-status-val" style="color: var(--warning);">Checking...</strong>
+                    </div>
+                    <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between;">
+                        <span>Progress:</span>
+                        <strong id="downloader-progress-val">0 / 0 days</strong>
+                    </div>
+                    <div id="downloader-time-row" style="font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between; margin-top: 0.25rem;">
+                        <span>Est. Time Left:</span>
+                        <strong id="downloader-time-val" style="color: #6366f1;">--:--</strong>
+                    </div>
+                </div>
+                <button id="downloader-action-btn" class="btn" style="width: 100%;">Start Data Collection</button>
+            </div>
+
+            <!-- Ingestion Pipeline Monitor Card -->
+            <div class="card">
+                <div class="card-title">Ingestion Pipeline Monitor</div>
+                
+                <h3 style="font-size: 0.8rem; color: var(--primary); margin-bottom: 0.5rem; letter-spacing: 0.05em;">🔄 ACTIVE & PAST JOBS</h3>
+                <div style="max-height: 160px; overflow-y: auto; margin-bottom: 1.5rem; border: 1px solid var(--border-color); border-radius: 8px; background: rgba(0,0,0,0.15);">
+                    <table style="margin-top: 0;" id="pipeline-jobs-table">
+                        <thead>
+                            <tr style="position: sticky; top: 0; background: #101524; z-index: 1;">
+                                <th style="padding: 0.5rem; font-size: 0.75rem;">Symbol</th>
+                                <th style="padding: 0.5rem; font-size: 0.75rem;">Year</th>
+                                <th style="padding: 0.5rem; font-size: 0.75rem;">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td colspan="3" style="text-align: center; color: var(--text-muted); padding: 0.75rem; font-size: 0.8rem;">No active pipeline jobs</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <h3 style="font-size: 0.8rem; color: var(--success); margin-bottom: 0.5rem; letter-spacing: 0.05em;">📊 LATEST INGESTED CANDLES (10)</h3>
+                <div style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; background: rgba(0,0,0,0.15);">
+                    <table style="margin-top: 0;" id="candles-preview-table">
+                        <thead>
+                            <tr style="position: sticky; top: 0; background: #101524; z-index: 1;">
+                                <th style="padding: 0.4rem; font-size: 0.75rem;">Time</th>
+                                <th style="padding: 0.4rem; font-size: 0.75rem;">O</th>
+                                <th style="padding: 0.4rem; font-size: 0.75rem;">H</th>
+                                <th style="padding: 0.4rem; font-size: 0.75rem;">L</th>
+                                <th style="padding: 0.4rem; font-size: 0.75rem;">C</th>
+                                <th style="padding: 0.4rem; font-size: 0.75rem;">V</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 0.75rem; font-size: 0.8rem;">Select symbol to preview</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
             <div class="card">
                 <div class="card-title">Fyers API Activation</div>
                 <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.5rem; line-height: 1.4;">
@@ -452,10 +651,15 @@ async fn index_handler() -> Html<&'static str> {
                 const response = await fetch('/portfolio');
                 const data = await response.json();
                 
-                if (data.funds) {
-                    document.getElementById('val-limit').textContent = `₹${data.funds.limit_amount.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
-                    document.getElementById('val-utilized').textContent = `₹${data.funds.utilised_balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
-                    document.getElementById('val-available').textContent = `₹${data.funds.available_balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                if (data.live_funds) {
+                    document.getElementById('live-val-limit').textContent = `₹${data.live_funds.limit_amount.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('live-val-utilized').textContent = `₹${data.live_funds.utilised_balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('live-val-available').textContent = `₹${data.live_funds.available_balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                }
+                if (data.paper_funds) {
+                    document.getElementById('paper-val-limit').textContent = `₹${data.paper_funds.limit_amount.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('paper-val-utilized').textContent = `₹${data.paper_funds.utilised_balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('paper-val-available').textContent = `₹${data.paper_funds.available_balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
                 }
 
                 const posTableBody = document.querySelector('#positions-table tbody');
@@ -523,7 +727,6 @@ async fn index_handler() -> Html<&'static str> {
                 return;
             }
 
-            // Extract auth code from redirect URL if full URL is pasted
             let authCode = input;
             if (input.includes('auth_code=')) {
                 const urlParams = new URLSearchParams(input.split('?')[1]);
@@ -544,7 +747,6 @@ async fn index_handler() -> Html<&'static str> {
                 if (response.ok && data.status === 'success') {
                     msg.textContent = 'Fyers Broker activated successfully!';
                     msg.style.color = 'var(--success)';
-                    // Reload health and balance after successful activation
                     setTimeout(() => {
                         checkHealth();
                         fetchPortfolio();
@@ -560,15 +762,265 @@ async fn index_handler() -> Html<&'static str> {
             }
         });
 
+        // Downloader Logic
+        const yearSelect = document.getElementById('download-year-select');
+        const symbolInput = document.getElementById('download-symbol-input');
+        const statusVal = document.getElementById('downloader-status-val');
+        const progressVal = document.getElementById('downloader-progress-val');
+        const timeVal = document.getElementById('downloader-time-val');
+        const timeRow = document.getElementById('downloader-time-row');
+        const actionBtn = document.getElementById('downloader-action-btn');
+        let statusPollInterval = null;
+
+        // Dynamic 25-years options populating
+        const currentYear = new Date().getFullYear();
+        yearSelect.innerHTML = '';
+        for (let y = currentYear; y > currentYear - 25; y--) {
+            const opt = document.createElement('option');
+            opt.value = y;
+            opt.textContent = y;
+            yearSelect.appendChild(opt);
+        }
+
+        async function checkDownloadStatus() {
+            const year = yearSelect.value;
+            const symbol = symbolInput.value.trim();
+            if (!symbol) return;
+            try {
+                const res = await fetch(`/database/download-status?year=${year}&symbol=${encodeURIComponent(symbol)}`);
+                const data = await res.json();
+                if (data.status === 'success') {
+                    const ds = data.download_status;
+                    progressVal.textContent = `${data.completed_days} / ${data.total_days} days`;
+                    
+                    if (ds === 'COMPLETED') {
+                        statusVal.textContent = 'COMPLETED';
+                        statusVal.style.color = 'var(--success)';
+                        timeRow.style.display = 'none';
+                        actionBtn.textContent = 'Download Data (Excel)';
+                        actionBtn.disabled = false;
+                        actionBtn.onclick = () => {
+                            window.location.href = `/database/download?year=${year}&symbol=${encodeURIComponent(symbol)}`;
+                        };
+                        if (statusPollInterval) {
+                            clearInterval(statusPollInterval);
+                            statusPollInterval = null;
+                        }
+                    } else if (ds === 'IN_PROGRESS') {
+                        statusVal.textContent = 'IN_PROGRESS';
+                        statusVal.style.color = 'var(--warning)';
+                        timeRow.style.display = 'flex';
+                        timeVal.textContent = data.time_remaining;
+                        actionBtn.textContent = `Collecting (${data.time_remaining})...`;
+                        actionBtn.disabled = true;
+                        actionBtn.onclick = null;
+                        
+                        if (!statusPollInterval) {
+                            statusPollInterval = setInterval(checkDownloadStatus, 2000);
+                        }
+                    } else {
+                        statusVal.textContent = 'NOT_STARTED';
+                        statusVal.style.color = 'var(--danger)';
+                        timeRow.style.display = 'flex';
+                        timeVal.textContent = data.time_remaining;
+                        actionBtn.textContent = 'Start Data Collection';
+                        actionBtn.disabled = false;
+                        actionBtn.onclick = startDataCollection;
+                        if (statusPollInterval) {
+                            clearInterval(statusPollInterval);
+                            statusPollInterval = null;
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error("Error fetching download status", e);
+            }
+        }
+
+        async function startDataCollection() {
+            const year = yearSelect.value;
+            const symbol = symbolInput.value.trim();
+            if (!symbol) return;
+            actionBtn.disabled = true;
+            actionBtn.textContent = 'Starting...';
+            try {
+                const res = await fetch('/database/start-download', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ year: parseInt(year), symbol })
+                });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    checkDownloadStatus();
+                    fetchPipelineJobs();
+                } else {
+                    alert('Failed to start download: ' + (data.message || 'unknown error'));
+                    checkDownloadStatus();
+                }
+            } catch (e) {
+                console.error("Error starting collection", e);
+                checkDownloadStatus();
+            }
+        }
+
+        async function fetchLiveStatus() {
+            try {
+                const res = await fetch('/live-status');
+                const data = await res.json();
+                const niftyPulse = document.getElementById('nifty-pulse-dot');
+                if (data.status === 'success' && data.live_status) {
+                    const ls = data.live_status;
+                    document.getElementById('live-nifty-val').textContent = `₹${ls.nifty_price.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('live-vix-val').textContent = ls.vix.toFixed(2);
+                    
+                    document.getElementById('opp-target-option').textContent = ls.target_option;
+                    document.getElementById('opp-quality-score').textContent = ls.quality_score.toFixed(1);
+                    
+                    if (ls.quality_score >= 75.0) {
+                        document.getElementById('opp-quality-score').style.color = 'var(--success)';
+                    } else if (ls.quality_score >= 50.0) {
+                        document.getElementById('opp-quality-score').style.color = 'var(--warning)';
+                    } else {
+                        document.getElementById('opp-quality-score').style.color = 'var(--danger)';
+                    }
+
+                    document.getElementById('opp-confidence').textContent = `${ls.opportunity_confidence.toFixed(1)}%`;
+                    document.getElementById('opp-probability').textContent = `${ls.opportunity_probability.toFixed(1)}%`;
+                    document.getElementById('opp-ml-confidence').textContent = `${ls.ml_confidence.toFixed(1)}%`;
+                    
+                    const badge = document.getElementById('opp-decision-badge');
+                    badge.textContent = ls.decision.toUpperCase();
+                    badge.className = 'status-badge'; 
+                    if (ls.decision === 'Trade') {
+                        badge.classList.add('badge-trade');
+                    } else if (ls.decision === 'ReduceSize') {
+                        badge.classList.add('badge-reduce');
+                    } else if (ls.decision === 'Cancel') {
+                        badge.classList.add('badge-cancel');
+                    } else {
+                        badge.classList.add('badge-wait');
+                    }
+
+                    const lastTime = new Date(ls.timestamp);
+                    const diff = (new Date() - lastTime) / 1000;
+                    if (diff < 5) {
+                        niftyPulse.style.backgroundColor = 'var(--success)';
+                        niftyPulse.style.boxShadow = '0 0 10px var(--success)';
+                        document.getElementById('last-update-time').textContent = 'LIVE CONNECTED';
+                        document.getElementById('last-update-time').style.color = 'var(--success)';
+                        document.getElementById('last-update-time').style.background = 'rgba(16, 185, 129, 0.1)';
+                    } else {
+                        niftyPulse.style.backgroundColor = 'var(--warning)';
+                        niftyPulse.style.boxShadow = '0 0 10px var(--warning)';
+                        document.getElementById('last-update-time').textContent = `INACTIVE: ${Math.round(diff)}s AGO`;
+                        document.getElementById('last-update-time').style.color = 'var(--warning)';
+                        document.getElementById('last-update-time').style.background = 'rgba(245, 158, 11, 0.1)';
+                    }
+                } else {
+                    niftyPulse.style.backgroundColor = 'var(--danger)';
+                    niftyPulse.style.boxShadow = '0 0 10px var(--danger)';
+                    document.getElementById('last-update-time').textContent = 'WORKER OFFLINE';
+                    document.getElementById('last-update-time').style.color = 'var(--danger)';
+                    document.getElementById('last-update-time').style.background = 'rgba(239, 68, 68, 0.1)';
+                }
+            } catch (e) {
+                console.error("Failed to fetch live status: ", e);
+            }
+        }
+
+        async function fetchPipelineJobs() {
+            try {
+                const res = await fetch('/database/jobs');
+                const data = await res.json();
+                const tbody = document.querySelector('#pipeline-jobs-table tbody');
+                if (data.status === 'success' && data.jobs && data.jobs.length > 0) {
+                    tbody.innerHTML = '';
+                    data.jobs.forEach(j => {
+                        const row = document.createElement('tr');
+                        let statusColor = 'var(--text-muted)';
+                        if (j.status === 'COMPLETED') statusColor = 'var(--success)';
+                        else if (j.status === 'IN_PROGRESS') statusColor = 'var(--warning)';
+                        else if (j.status.startsWith('FAILED')) statusColor = 'var(--danger)';
+                        
+                        row.innerHTML = `
+                            <td style="padding: 0.5rem; font-size: 0.8rem;"><strong>${j.symbol}</strong></td>
+                            <td style="padding: 0.5rem; font-size: 0.8rem;">${j.from_date.substring(0, 4)}</td>
+                            <td style="padding: 0.5rem; color: ${statusColor}; font-weight: 600; font-size: 0.8rem;">${j.status}</td>
+                        `;
+                        tbody.appendChild(row);
+                    });
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: var(--text-muted); padding: 0.75rem; font-size: 0.8rem;">No active pipeline jobs</td></tr>';
+                }
+            } catch (e) {
+                console.error("Failed to fetch jobs: ", e);
+            }
+        }
+
+        async function fetchCandlesPreview() {
+            const year = yearSelect.value;
+            const symbol = symbolInput.value.trim();
+            if (!symbol) return;
+            try {
+                const res = await fetch(`/database/candles-preview?symbol=${encodeURIComponent(symbol)}&year=${year}`);
+                const data = await res.json();
+                const tbody = document.querySelector('#candles-preview-table tbody');
+                if (data.status === 'success' && data.candles && data.candles.length > 0) {
+                    tbody.innerHTML = '';
+                    data.candles.forEach(c => {
+                        const row = document.createElement('tr');
+                        const timeStr = new Date(c.timestamp).toLocaleTimeString('en-IN', {hour: '2-digit', minute:'2-digit', second: '2-digit'});
+                        row.innerHTML = `
+                            <td style="padding: 0.4rem; font-size: 0.75rem;">${timeStr}</td>
+                            <td style="padding: 0.4rem; font-size: 0.75rem;">₹${c.open.toFixed(2)}</td>
+                            <td style="padding: 0.4rem; font-size: 0.75rem;">₹${c.high.toFixed(2)}</td>
+                            <td style="padding: 0.4rem; font-size: 0.75rem;">₹${c.low.toFixed(2)}</td>
+                            <td style="padding: 0.4rem; font-size: 0.75rem;">₹${c.close.toFixed(2)}</td>
+                            <td style="padding: 0.4rem; font-size: 0.75rem;">${c.volume}</td>
+                        `;
+                        tbody.appendChild(row);
+                    });
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 0.75rem; font-size: 0.8rem;">No candles found in database</td></tr>';
+                }
+            } catch (e) {
+                console.error("Failed to fetch candles preview: ", e);
+            }
+        }
+
+        yearSelect.addEventListener('change', () => {
+            if (statusPollInterval) {
+                clearInterval(statusPollInterval);
+                statusPollInterval = null;
+            }
+            checkDownloadStatus();
+            fetchCandlesPreview();
+        });
+        symbolInput.addEventListener('change', () => {
+            if (statusPollInterval) {
+                clearInterval(statusPollInterval);
+                statusPollInterval = null;
+            }
+            checkDownloadStatus();
+            fetchCandlesPreview();
+        });
+
         // Initialize and poll status
         fetchAuthUrl();
         checkHealth();
         fetchPortfolio();
         fetchOrders();
+        checkDownloadStatus();
+        fetchLiveStatus();
+        fetchPipelineJobs();
+        fetchCandlesPreview();
         
+        setInterval(fetchLiveStatus, 1000);
         setInterval(() => {
             fetchPortfolio();
             fetchOrders();
+            fetchPipelineJobs();
+            fetchCandlesPreview();
         }, 5000);
     </script>
 </body>
@@ -587,12 +1039,14 @@ async fn health_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serd
 }
 
 async fn portfolio_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serde_json::Value> {
-    let funds = state.broker.funds().await.ok();
+    let live_funds = state.broker.live.funds().await.ok();
+    let paper_funds = state.broker.paper.funds().await.ok();
     let positions = state.broker.positions().await.unwrap_or_default();
     let holdings = state.broker.holdings().await.unwrap_or_default();
     
     Json(serde_json::json!({
-        "funds": funds,
+        "live_funds": live_funds,
+        "paper_funds": paper_funds,
         "positions": positions,
         "holdings": holdings
     }))
@@ -700,4 +1154,474 @@ async fn login_token_handler(
         }
     }
 }
+
+async fn metrics_handler(Extension(state): Extension<Arc<AppState>>) -> impl IntoResponse {
+    let mut body = String::new();
+
+    // 1. Fetch funds metrics
+    if let Ok(funds) = state.broker.funds().await {
+        body.push_str("# HELP price_portfolio_balance_rupees Total available portfolio balance in rupees\n");
+        body.push_str("# TYPE price_portfolio_balance_rupees gauge\n");
+        body.push_str(&format!("price_portfolio_balance_rupees {:.2}\n", funds.available_balance));
+
+        body.push_str("# HELP price_portfolio_utilized_margin_rupees Total utilized margin in rupees\n");
+        body.push_str("# TYPE price_portfolio_utilized_margin_rupees gauge\n");
+        body.push_str(&format!("price_portfolio_utilized_margin_rupees {:.2}\n", funds.utilised_balance));
+
+        body.push_str("# HELP price_portfolio_limit_amount_rupees Total limit amount in rupees\n");
+        body.push_str("# TYPE price_portfolio_limit_amount_rupees gauge\n");
+        body.push_str(&format!("price_portfolio_limit_amount_rupees {:.2}\n", funds.limit_amount));
+    }
+
+    // 2. Fetch position metrics
+    if let Ok(positions) = state.broker.positions().await {
+        body.push_str("# HELP price_open_positions_count Total count of open positions\n");
+        body.push_str("# TYPE price_open_positions_count gauge\n");
+        body.push_str(&format!("price_open_positions_count {}\n", positions.len()));
+        
+        let mut total_pnl = 0.0;
+        for p in &positions {
+            total_pnl += p.pnl;
+        }
+        body.push_str("# HELP price_open_positions_pnl_rupees Total unrealized PnL of open positions\n");
+        body.push_str("# TYPE price_open_positions_pnl_rupees gauge\n");
+        body.push_str(&format!("price_open_positions_pnl_rupees {:.2}\n", total_pnl));
+    }
+
+    // 3. Fetch orders & trades metrics
+    if let Ok(orders) = state.broker.orderbook().await {
+        body.push_str("# HELP price_orders_count Total count of orders in the orderbook\n");
+        body.push_str("# TYPE price_orders_count counter\n");
+        body.push_str(&format!("price_orders_count {}\n", orders.len()));
+    }
+
+    if let Ok(trades) = state.broker.trades().await {
+        body.push_str("# HELP price_trades_count Total count of executed trades in the tradebook\n");
+        body.push_str("# TYPE price_trades_count counter\n");
+        body.push_str(&format!("price_trades_count {}\n", trades.len()));
+    }
+
+    axum::response::Response::builder()
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+#[derive(serde::Deserialize)]
+struct StatusParams {
+    year: i32,
+    symbol: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StartParams {
+    year: i32,
+    symbol: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DownloadParams {
+    year: i32,
+    symbol: String,
+}
+
+async fn download_status_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<StatusParams>,
+) -> impl IntoResponse {
+    let year = params.year;
+    let symbol = params.symbol;
+
+    let expected_days = get_trading_days(year);
+    let expected_count = expected_days.len() as i64;
+    let completed_count = get_completed_jobs_count(&state.db.pool, &symbol, year).await.unwrap_or(0);
+    
+    let total_jobs_in_db = get_downloaded_dates(&state.db.pool, &symbol, year).await.unwrap_or_default().len() as i64;
+
+    let (status, time_remaining) = if completed_count >= expected_count {
+        ("COMPLETED".to_string(), "00:00".to_string())
+    } else {
+        let st = if total_jobs_in_db > 0 { "IN_PROGRESS".to_string() } else { "NOT_STARTED".to_string() };
+        let remaining_days = expected_count - completed_count;
+        let seconds = remaining_days * 5;
+        (st, format_time_remaining(seconds))
+    };
+
+    Json(serde_json::json!({
+        "status": "success",
+        "download_status": status,
+        "completed_days": completed_count,
+        "total_days": expected_count,
+        "time_remaining": time_remaining
+    }))
+}
+
+async fn start_download_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(payload): Json<StartParams>,
+) -> impl IntoResponse {
+    let year = payload.year;
+    let symbol = payload.symbol;
+
+    let expected_days = get_trading_days(year);
+    let mut downloaded_dates = get_downloaded_dates(&state.db.pool, &symbol, year).await.unwrap_or_default();
+
+    for date in expected_days {
+        if !downloaded_dates.contains(&date) {
+            let _ = sqlx::query(
+                "INSERT INTO download_jobs (symbol, from_date, to_date, status) 
+                 VALUES ($1, $2, $2, 'PENDING') 
+                 ON CONFLICT (symbol, from_date, to_date) DO NOTHING"
+            )
+            .bind(&symbol)
+            .bind(date)
+            .execute(&state.db.pool)
+            .await;
+            downloaded_dates.insert(date);
+        }
+    }
+
+    Json(serde_json::json!({
+        "status": "success",
+        "message": "Download pipeline started for requested data"
+    }))
+}
+
+async fn download_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DownloadParams>,
+) -> impl IntoResponse {
+    let year = params.year;
+    let symbol = params.symbol;
+
+    let expected_days = get_trading_days(year);
+    let expected_count = expected_days.len() as i64;
+    let completed_count = get_completed_jobs_count(&state.db.pool, &symbol, year).await.unwrap_or(0);
+
+    if completed_count < expected_count {
+        let remaining_days = expected_count - completed_count;
+        let seconds = remaining_days * 5;
+        let time_remaining = format_time_remaining(seconds);
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::response::Html(format!(
+                "<h3>Data is still being collected at VPS. As per current rate it will take {} time.</h3>",
+                time_remaining
+            ))
+        ).into_response();
+    }
+
+    // Query candles
+    let candles_query = sqlx::query(
+        "SELECT timestamp, open, high, low, close, volume 
+         FROM candles 
+         WHERE symbol = $1 
+           AND EXTRACT(YEAR FROM timestamp)::integer = $2 
+         ORDER BY timestamp ASC"
+    )
+    .bind(&symbol)
+    .bind(year)
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match candles_query {
+        Ok(rows) => {
+            let mut csv_data = String::new();
+            csv_data.push_str("Timestamp (UTC),Open,High,Low,Close,Volume\n");
+            for r in rows {
+                let ts: chrono::DateTime<chrono::Utc> = r.get("timestamp");
+                let open: f64 = r.get("open");
+                let high: f64 = r.get("high");
+                let low: f64 = r.get("low");
+                let close: f64 = r.get("close");
+                let vol: i64 = r.get("volume");
+                csv_data.push_str(&format!(
+                    "{},{},{},{},{},{}\n",
+                    ts.to_rfc3339(), open, high, low, close, vol
+                ));
+            }
+
+            let filename = format!("{}_{}.csv", symbol.replace(":", "_"), year);
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header("content-type", "text/csv")
+                .header("content-disposition", format!("attachment; filename=\"{}\"", filename))
+                .body(axum::body::Body::from(csv_data))
+                .unwrap()
+                .into_response()
+        }
+        Err(e) => {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to retrieve data: {}", e)
+            ).into_response()
+        }
+    }
+}
+
+fn get_trading_days(year: i32) -> Vec<chrono::NaiveDate> {
+    use chrono::{NaiveDate, Datelike, Weekday};
+    let start_date = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
+    let now = chrono::Utc::now().naive_utc().date();
+    let end_date = if year == now.year() {
+        now
+    } else {
+        NaiveDate::from_ymd_opt(year, 12, 31).unwrap()
+    };
+
+    // Standard fixed-date NSE holidays
+    let fixed_holidays = vec![
+        (1, 26),  // Republic Day
+        (5, 1),   // Maharashtra Day
+        (8, 15),  // Independence Day
+        (10, 2),  // Gandhi Jayanti
+        (12, 25), // Christmas
+    ];
+
+    let mut days = Vec::new();
+    let mut curr = start_date;
+    while curr <= end_date {
+        let wd = curr.weekday();
+        let is_weekend = wd == Weekday::Sat || wd == Weekday::Sun;
+        let is_fixed_holiday = fixed_holidays.iter().any(|&(m, d)| curr.month() == m && curr.day() == d);
+        if !is_weekend && !is_fixed_holiday {
+            days.push(curr);
+        }
+        if let Some(next) = curr.succ_opt() {
+            curr = next;
+        } else {
+            break;
+        }
+    }
+    days
+}
+
+async fn get_completed_jobs_count(pool: &sqlx::PgPool, symbol: &str, year: i32) -> anyhow::Result<i64> {
+    let row = sqlx::query(
+        "SELECT count(*) as count 
+         FROM download_jobs 
+         WHERE symbol = $1 
+           AND EXTRACT(YEAR FROM from_date)::integer = $2 
+           AND status = 'COMPLETED'"
+    )
+    .bind(symbol)
+    .bind(year)
+    .fetch_one(pool)
+    .await?;
+    
+    let count: i64 = row.get("count");
+    Ok(count)
+}
+
+async fn get_downloaded_dates(pool: &sqlx::PgPool, symbol: &str, year: i32) -> anyhow::Result<std::collections::HashSet<chrono::NaiveDate>> {
+    let rows = sqlx::query(
+        "SELECT from_date 
+         FROM download_jobs 
+         WHERE symbol = $1 
+           AND EXTRACT(YEAR FROM from_date)::integer = $2"
+    )
+    .bind(symbol)
+    .bind(year)
+    .fetch_all(pool)
+    .await?;
+    
+    let mut dates = std::collections::HashSet::new();
+    for r in rows {
+        let d: chrono::NaiveDate = r.get("from_date");
+        dates.insert(d);
+    }
+    Ok(dates)
+}
+
+fn format_time_remaining(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "00:00".to_string();
+    }
+    let h = seconds / 3600;
+    let m = (seconds % 3600) / 60;
+    let s = seconds % 60;
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{:02}:{:02}", m, s)
+    }
+}
+
+async fn start_background_downloader(db: TimescaleClient, python_broker_url: String) {
+    tokio::spawn(async move {
+        info!("Starting background historical data downloader thread...");
+        let downloader = price_backtester::HistoricalDownloader::new(&python_broker_url, db.clone());
+        loop {
+            // Query for the next PENDING or FAILED job
+            let next_job = sqlx::query(
+                "SELECT symbol, from_date, to_date 
+                 FROM download_jobs 
+                 WHERE status = 'PENDING' OR status LIKE 'FAILED%' 
+                 ORDER BY last_updated ASC 
+                 LIMIT 1"
+            )
+            .fetch_optional(&db.pool)
+            .await;
+
+            match next_job {
+                Ok(Some(row)) => {
+                    let symbol: String = row.get("symbol");
+                    let from_date: chrono::NaiveDate = row.get("from_date");
+                    let to_date: chrono::NaiveDate = row.get("to_date");
+                    info!("Background downloader executing job for {} from {} to {}", symbol, from_date, to_date);
+                    
+                    // Mark as IN_PROGRESS
+                    let _ = db.mark_job_status(&symbol, from_date, to_date, "IN_PROGRESS").await;
+
+                    // Download history
+                    match downloader.download_history(&symbol, "NSE", from_date, to_date).await {
+                        Ok(_) => {
+                            info!("Successfully finished background download job for {} from {} to {}", symbol, from_date, to_date);
+                            let _ = db.mark_job_status(&symbol, from_date, to_date, "COMPLETED").await;
+                        }
+                        Err(e) => {
+                            error!("Background downloader job failed for {} from {} to {}: {:?}", symbol, from_date, to_date, e);
+                            let _ = db.mark_job_status(&symbol, from_date, to_date, &format!("FAILED: {}", e)).await;
+                        }
+                    }
+                    
+                    // Sleep for 5 seconds to comply with rate limits (1 request every 5 seconds)
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+                Ok(None) => {
+                    // No pending jobs, wait before querying again
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    error!("Database error in background downloader loop: {:?}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
+}
+
+async fn get_live_status_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let status = state.live_status.read().unwrap().clone();
+    Json(serde_json::json!({
+        "status": "success",
+        "live_status": status
+    }))
+}
+
+async fn post_live_status_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(payload): Json<LiveStatusInfo>,
+) -> Json<serde_json::Value> {
+    *state.live_status.write().unwrap() = Some(payload);
+    Json(serde_json::json!({
+        "status": "success"
+    }))
+}
+
+async fn database_jobs_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let jobs = sqlx::query(
+        "SELECT symbol, from_date, to_date, status, last_updated, retry_count 
+         FROM download_jobs 
+         ORDER BY last_updated DESC 
+         LIMIT 20"
+    )
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match jobs {
+        Ok(rows) => {
+            let mut list = Vec::new();
+            for r in rows {
+                let symbol: String = r.get("symbol");
+                let from_date: chrono::NaiveDate = r.get("from_date");
+                let to_date: chrono::NaiveDate = r.get("to_date");
+                let status: String = r.get("status");
+                let last_updated: chrono::DateTime<chrono::Utc> = r.get("last_updated");
+                let retry_count: i32 = r.get("retry_count");
+
+                list.push(serde_json::json!({
+                    "symbol": symbol,
+                    "from_date": from_date.to_string(),
+                    "to_date": to_date.to_string(),
+                    "status": status,
+                    "last_updated": last_updated.to_rfc3339(),
+                    "retry_count": retry_count
+                }));
+            }
+            Json(serde_json::json!({
+                "status": "success",
+                "jobs": list
+            }))
+        }
+        Err(e) => {
+            Json(serde_json::json!({
+                "status": "error",
+                "message": e.to_string()
+            }))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PreviewParams {
+    symbol: String,
+    year: i32,
+}
+
+async fn candles_preview_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<PreviewParams>,
+) -> Json<serde_json::Value> {
+    let candles = sqlx::query(
+        "SELECT timestamp, open, high, low, close, volume 
+         FROM candles 
+         WHERE symbol = $1 
+           AND EXTRACT(YEAR FROM timestamp)::integer = $2 
+         ORDER BY timestamp DESC 
+         LIMIT 10"
+    )
+    .bind(&params.symbol)
+    .bind(params.year)
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match candles {
+        Ok(rows) => {
+            let mut list = Vec::new();
+            for r in rows {
+                let ts: chrono::DateTime<chrono::Utc> = r.get("timestamp");
+                let open: f64 = r.get("open");
+                let high: f64 = r.get("high");
+                let low: f64 = r.get("low");
+                let close: f64 = r.get("close");
+                let vol: i64 = r.get("volume");
+
+                list.push(serde_json::json!({
+                    "timestamp": ts.to_rfc3339(),
+                    "open": open,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": vol
+                }));
+            }
+            Json(serde_json::json!({
+                "status": "success",
+                "candles": list
+            }))
+        }
+        Err(e) => {
+            Json(serde_json::json!({
+                "status": "error",
+                "message": e.to_string()
+            }))
+        }
+    }
+}
+
 

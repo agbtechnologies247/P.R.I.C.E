@@ -34,6 +34,9 @@ pub enum PriceError {
 
     #[error("System failure: {0}")]
     System(String),
+
+    #[error("Indian market is closed. Trades can only be placed Mon-Fri 09:15 - 15:30 IST (excluding holidays).")]
+    MarketClosed,
 }
 
 pub type Result<T> = std::result::Result<T, PriceError>;

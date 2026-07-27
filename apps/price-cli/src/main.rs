@@ -34,6 +34,16 @@ enum Commands {
         #[arg(long)]
         to: String,
     },
+    /// Sync historical candles to current date (weekly incremental updates)
+    Sync {
+        /// Symbol (e.g. NSE:NIFTY50-INDEX)
+        #[arg(long)]
+        symbol: String,
+
+        /// Exchange prefix
+        #[arg(long, default_value = "NSE")]
+        exchange: String,
+    },
     /// Run historical strategy backtest
     Backtest {
         /// Symbol (e.g. NSE:NIFTY50-INDEX)
@@ -49,7 +59,7 @@ enum Commands {
         to: String,
 
         /// Initial capital balance (INR)
-        #[arg(long, default_value = "100000.0")]
+        #[arg(long, default_value = "10000.0")]
         capital: f64,
 
         /// Output folder path for generated reports
@@ -69,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/price".to_string());
+        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5433/price".to_string());
     let python_broker_url = std::env::var("PYTHON_BROKER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
 
@@ -80,6 +90,23 @@ async fn main() -> anyhow::Result<()> {
         Commands::Download { symbol, exchange, from, to } => {
             let from_date = NaiveDate::parse_from_str(&from, "%Y-%m-%d")?;
             let to_date = NaiveDate::parse_from_str(&to, "%Y-%m-%d")?;
+
+            let downloader = HistoricalDownloader::new(&python_broker_url, db);
+            downloader.download_history(&symbol, &exchange, from_date, to_date).await?;
+        }
+        Commands::Sync { symbol, exchange } => {
+            let to_date = chrono::Utc::now().date_naive();
+            
+            let from_date = if let Ok(Some(last_ts)) = db.get_last_candle_timestamp(&symbol).await {
+                last_ts.date_naive()
+            } else {
+                to_date - chrono::Duration::days(30)
+            };
+
+            tracing::info!(
+                "Syncing symbol {} on exchange {}. Database last candle date: {}. Target date: {}.",
+                symbol, exchange, from_date, to_date
+            );
 
             let downloader = HistoricalDownloader::new(&python_broker_url, db);
             downloader.download_history(&symbol, &exchange, from_date, to_date).await?;

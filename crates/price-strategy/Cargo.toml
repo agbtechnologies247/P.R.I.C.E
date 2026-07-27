@@ -6,5 +6,6 @@ edition = "2021"
 [dependencies]
 price-core = { path = "../price-core" }
 price-indicators = { path = "../price-indicators" }
+price-ml = { path = "../price-ml" }
 serde.workspace = true
 chrono.workspace = true

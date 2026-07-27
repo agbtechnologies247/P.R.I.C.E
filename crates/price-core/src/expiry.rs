@@ -1,4 +1,38 @@
-use chrono::{NaiveDate, Weekday, Datelike};
+use chrono::{NaiveDate, Weekday, Datelike, DateTime, Utc, Timelike};
+
+/// Checks if a UTC timestamp falls within Indian Standard Time (IST = UTC + 5:30) NSE market hours:
+/// - Weekday: Monday to Friday
+/// - Time: 09:15:00 to 15:30:00 IST
+/// - Date: Not in standard NSE holidays list
+pub fn is_indian_market_hours(timestamp: DateTime<Utc>) -> bool {
+    let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+    let ist_time = timestamp.with_timezone(&ist_offset);
+    
+    let weekday = ist_time.weekday();
+    if weekday == Weekday::Sat || weekday == Weekday::Sun {
+        return false;
+    }
+    
+    let hour = ist_time.hour();
+    let minute = ist_time.minute();
+    let second = ist_time.second();
+    
+    let total_secs = hour * 3600 + minute * 60 + second;
+    let market_start_secs = 9 * 3600 + 15 * 60; // 09:15:00
+    let market_end_secs = 15 * 3600 + 30 * 60;  // 15:30:00
+    
+    if total_secs < market_start_secs || total_secs > market_end_secs {
+        return false;
+    }
+    
+    let date = ist_time.date_naive();
+    let holidays = get_nse_holidays_2026();
+    if holidays.contains(&date) {
+        return false;
+    }
+    
+    true
+}
 
 /// Returns the next upcoming Tuesday on or after `date`.
 pub fn get_next_tuesday(date: NaiveDate) -> NaiveDate {
@@ -123,5 +157,30 @@ mod tests {
 
         let d3 = NaiveDate::from_ymd_opt(2026, 12, 15).unwrap();
         assert_eq!(format_fyers_expiry_suffix(d3), "26D15");
+    }
+
+    #[test]
+    fn test_is_indian_market_hours() {
+        use chrono::TimeZone;
+        
+        // 1. Wed, July 22, 2026 at 10:30 AM IST (which is 05:00 AM UTC) -> should be true
+        let dt_open = Utc.with_ymd_and_hms(2026, 7, 22, 5, 0, 0).unwrap();
+        assert!(is_indian_market_hours(dt_open));
+
+        // 2. Wed, July 22, 2026 at 08:30 AM IST (which is 03:00 AM UTC) -> should be false (too early)
+        let dt_early = Utc.with_ymd_and_hms(2026, 7, 22, 3, 0, 0).unwrap();
+        assert!(!is_indian_market_hours(dt_early));
+
+        // 3. Wed, July 22, 2026 at 04:00 PM IST (which is 10:30 AM UTC) -> should be false (too late)
+        let dt_late = Utc.with_ymd_and_hms(2026, 7, 22, 10, 30, 0).unwrap();
+        assert!(!is_indian_market_hours(dt_late));
+
+        // 4. Sun, July 26, 2026 at 11:00 AM IST (which is 05:30 AM UTC) -> should be false (weekend)
+        let dt_weekend = Utc.with_ymd_and_hms(2026, 7, 26, 5, 30, 0).unwrap();
+        assert!(!is_indian_market_hours(dt_weekend));
+
+        // 5. Republic Day 2026 (Jan 26, Mon) -> should be false (holiday)
+        let dt_holiday = Utc.with_ymd_and_hms(2026, 1, 26, 5, 30, 0).unwrap();
+        assert!(!is_indian_market_hours(dt_holiday));
     }
 }

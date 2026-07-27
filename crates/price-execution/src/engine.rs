@@ -17,13 +17,14 @@ pub struct ExecutionOrchestrator {
     atr_calc: AtrCalculator,
     price_history: Vec<f64>,
     closed_candles: Vec<price_core::Candle>,
+    ml_predictor: price_ml::MlPredictor,
     
     // Live Indicators
-    current_atr: f64,
-    current_vix: f64,
-    current_spread: f64,
-    current_ml_confidence: f64,
-    current_nifty_spot: f64,
+    pub current_atr: f64,
+    pub current_vix: f64,
+    pub current_spread: f64,
+    pub current_ml_confidence: f64,
+    pub current_nifty_spot: f64,
     
     // Active trade tracking
     active_position: Option<Position>,
@@ -31,6 +32,12 @@ pub struct ExecutionOrchestrator {
     target_price: f64,
     stop_price: f64,
     hold_minutes: i64,
+    
+    // Live opportunity tracking
+    pub last_opportunity: Option<price_strategy::TradeOpportunity>,
+    pub last_decision: Option<price_strategy::Decision>,
+    pub last_quality: Option<price_strategy::TradeQualityScore>,
+    pub last_target_option: Option<String>,
 }
 
 impl ExecutionOrchestrator {
@@ -51,6 +58,7 @@ impl ExecutionOrchestrator {
             atr_calc: AtrCalculator::new(14),
             price_history: Vec::new(),
             closed_candles: Vec::new(),
+            ml_predictor: price_ml::MlPredictor::new(None),
             current_atr: 12.0,
             current_vix: 15.0,
             current_spread: 0.20,
@@ -61,6 +69,10 @@ impl ExecutionOrchestrator {
             target_price: 0.0,
             stop_price: 0.0,
             hold_minutes: 0,
+            last_opportunity: None,
+            last_decision: None,
+            last_quality: None,
+            last_target_option: None,
         }
     }
 
@@ -206,6 +218,21 @@ impl ExecutionOrchestrator {
                 }
             }
         } else {
+            // Determine target option contract
+            let is_bullish = geometry.slope >= 0.0;
+            let strike = (self.current_nifty_spot / 50.0).round() * 50.0;
+            let tick_date = tick.timestamp.naive_utc().date();
+            let holidays = price_core::get_nse_holidays_2026();
+            let expiry_date = price_core::calculate_nifty_expiry(tick_date, &holidays);
+            let suffix = price_core::format_fyers_expiry_suffix(expiry_date);
+            let prefix = format!("NSE:NIFTY{}", suffix);
+            let target_symbol = if is_bullish {
+                format!("{}{:.0}CE", prefix, strike)
+            } else {
+                format!("{}{:.0}PE", prefix, strike)
+            };
+            self.last_target_option = Some(target_symbol);
+
             // 7. Evaluates Entry rules
             let oi_increasing = tick.volume > 5000; 
             let volume_spike = tick.volume > 10000;
@@ -234,6 +261,22 @@ impl ExecutionOrchestrator {
                 })
                 .fold(0.0f64, |acc: f64, val: f64| acc.max(val));
 
+            // Calculate live ML win rate probability dynamically using price-ml
+            let ml_features = price_ml::MlFeatures {
+                price: tick.price,
+                vwap: current_vwap,
+                vix: self.current_vix,
+                oi_increasing,
+                volume_spike,
+                slope: geometry.slope,
+                expansion: geometry.expansion,
+                compression: geometry.compression,
+                curvature: geometry.curvature,
+                fib_confluence: fib_confluence_score,
+                sr_proximity: sr_proximity_score,
+            };
+            self.current_ml_confidence = self.ml_predictor.predict_win_rate(&ml_features);
+
             let (opportunity, decision) = self.opportunity_engine.evaluate_entry(
                 tick.price,
                 current_vwap,
@@ -246,6 +289,9 @@ impl ExecutionOrchestrator {
                 fib_confluence_score,
                 sr_proximity_score,
             );
+
+            self.last_opportunity = Some(opportunity.clone());
+            self.last_decision = Some(decision);
 
             events.push(EngineEvent::ConfidenceUpdated {
                 score: opportunity.confidence,
@@ -261,6 +307,7 @@ impl ExecutionOrchestrator {
                 3.0,  // Reward-risk ratio
                 0.65, // ML win rate
             );
+            self.last_quality = Some(quality.clone());
 
             if decision == Decision::Trade {
                 info!("Strategy triggered entry signal. Trade Quality Score: {:.2}", quality.total);
@@ -269,27 +316,10 @@ impl ExecutionOrchestrator {
                     warn!("Trade candidate rejected due to insufficient Quality Score: {:.2} < {:.2}", 
                         quality.total, self.opportunity_engine.quality_threshold);
                 } else {
-                    // Determine which option symbol to buy: Call (CE) for bullish, Put (PE) for bearish
-                    let is_bullish = geometry.slope >= 0.0;
-                    
-                    // Dynamic Strike calculation: round Nifty spot to nearest 50 strikes
-                    let strike = (self.current_nifty_spot / 50.0).round() * 50.0;
-                    
-                    // Calculate target expiry dynamics
-                    let tick_date = tick.timestamp.naive_utc().date();
-                    let holidays = price_core::get_nse_holidays_2026();
-                    let expiry_date = price_core::calculate_nifty_expiry(tick_date, &holidays);
-                    let suffix = price_core::format_fyers_expiry_suffix(expiry_date);
-                    let prefix = format!("NSE:NIFTY{}", suffix);
-                    
-                    let target_symbol = if is_bullish {
-                        format!("{}{:.0}CE", prefix, strike)
-                    } else {
-                        format!("{}{:.0}PE", prefix, strike)
-                    };
+                    let target_symbol = self.last_target_option.clone().unwrap_or_default();
 
-                    info!("Selected dynamic target option: {} (Nifty Spot: {:.2}, Strike: {:.0}, Bullish: {})", 
-                        target_symbol, self.current_nifty_spot, strike, is_bullish);
+                    info!("Selected dynamic target option: {} (Nifty Spot: {:.2})", 
+                        target_symbol, self.current_nifty_spot);
 
                     // Fetch the latest quote of the target option contract to calculate accurate pricing
                     let mut option_price = tick.price;

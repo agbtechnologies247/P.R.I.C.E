@@ -9,6 +9,7 @@ price-broker = { path = "../price-broker" }
 price-indicators = { path = "../price-indicators" }
 price-strategy = { path = "../price-strategy" }
 price-risk = { path = "../price-risk" }
+price-ml = { path = "../price-ml" }
 tokio.workspace = true
 serde.workspace = true
 chrono.workspace = true

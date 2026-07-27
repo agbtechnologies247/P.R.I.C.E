@@ -17,7 +17,7 @@ pub struct ReplayBroker {
     current_prices: DashMap<String, Quote>,
     slippage_pct: f64,
     commission: f64,
-    pub current_time: Arc<Mutex<DateTime<Utc>>>,
+    pub current_time: Arc<std::sync::Mutex<DateTime<Utc>>>,
     db: TimescaleClient,
     python_broker_url: String,
 }
@@ -43,14 +43,14 @@ impl ReplayBroker {
             current_prices: DashMap::new(),
             slippage_pct,
             commission,
-            current_time: Arc::new(Mutex::new(Utc::now())),
+            current_time: Arc::new(std::sync::Mutex::new(Utc::now())),
             db,
             python_broker_url,
         }
     }
 
     pub fn set_current_time(&self, time: DateTime<Utc>) {
-        let mut t = futures::executor::block_on(self.current_time.lock());
+        let mut t = self.current_time.lock().unwrap();
         *t = time;
     }
 
@@ -300,7 +300,7 @@ impl Broker for ReplayBroker {
                 quotes.push(q.value().clone());
             } else if let Some((strike, is_call)) = parse_option_symbol(&sym) {
                 let current_time = {
-                    let t_guard = self.current_time.lock().await;
+                    let t_guard = self.current_time.lock().unwrap();
                     *t_guard
                 };
 

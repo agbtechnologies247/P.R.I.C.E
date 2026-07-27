@@ -139,4 +139,37 @@ impl TimescaleClient {
 
         Ok(rows.into_iter().map(|r| r.get::<NaiveDate, _>("date")).collect())
     }
+
+    pub async fn get_last_candle_timestamp(
+        &self,
+        symbol: &str,
+    ) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let row = sqlx::query(
+            "SELECT max(timestamp) as max_ts FROM candles WHERE symbol = $1"
+        )
+        .bind(symbol)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let max_ts: Option<DateTime<Utc>> = r.get("max_ts");
+                Ok(max_ts)
+            }
+            None => Ok(None)
+        }
+    }
+
+    pub async fn get_db_stats(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT symbol, count(*) as count FROM candles GROUP BY symbol ORDER BY count DESC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("symbol"), r.get::<i64, _>("count")))
+            .collect())
+    }
 }
