@@ -14,7 +14,6 @@ import config
 from database import init_db
 import state
 import websocket_handler
-import mock_engine
 from models import HistoryRequest
 import auth
 import orders
@@ -107,12 +106,8 @@ def get_history(req: HistoryRequest):
         print(f"SQLite reading cache failed: {e}")
 
     # 2. Cache miss: If in mock mode, generate mock candles
-    if fyers == "mock":
-        try:
-            candles = mock_engine.generate_mock_candles(req.symbol, req.range_from, req.range_to)
-            return {"status": "success", "data": {"candles": candles}}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to generate mock historical data: {e}")
+    if fyers is None or fyers == "mock":
+        raise HTTPException(status_code=400, detail="Fyers API client is uninitialized or unauthenticated. Please authenticate via dashboard first.")
 
     # 3. Cache miss: Query Fyers API
     try:
@@ -144,13 +139,10 @@ def get_history(req: HistoryRequest):
                     print(f"SQLite writing cache failed: {e}")
             return {"status": "success", "data": {"candles": candles}}
         else:
-            print(f"Fyers history query returned error: {res.get('message')}. Falling back to mock generator.")
-            candles = mock_engine.generate_mock_candles(req.symbol, req.range_from, req.range_to)
-            return {"status": "success", "data": {"candles": candles}}
+            detail = res.get("message", "Unknown error from Fyers history API")
+            raise HTTPException(status_code=400, detail=f"Fyers history query failed: {detail}")
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Fyers client history exception: {e}. Falling back to mock generator.")
-        try:
-            candles = mock_engine.generate_mock_candles(req.symbol, req.range_from, req.range_to)
-            return {"status": "success", "data": {"candles": candles}}
-        except Exception as mock_err:
-            raise HTTPException(status_code=500, detail=f"Fyers failed and mock generator failed: {mock_err}")
+        print(f"Fyers client history exception: {e}")
+        raise HTTPException(status_code=500, detail=f"Fyers history query failed with server error: {str(e)}")

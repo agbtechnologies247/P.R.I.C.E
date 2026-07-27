@@ -35,8 +35,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting PRICE Quantitative Trading Worker...");
 
     // 2. Load configurations
-    let use_simulated = std::env::var("USE_SIMULATED_FEED")
-        .unwrap_or_else(|_| "false".to_string()) == "true";
     let python_broker_url = std::env::var("PYTHON_BROKER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
     let daily_loss_limit = std::env::var("DAILY_LOSS_LIMIT")
@@ -94,268 +92,217 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Map to track stock details: symbol -> (ltp, prev_close)
     let mut stock_prices: HashMap<String, (f64, f64)> = HashMap::new();
 
-    // 5. Ingestion Loop (Simulated OR WebSocket live data feed)
-    if use_simulated {
-        info!("Starting tick ingestion simulation loop...");
-        let mut interval = time::interval(Duration::from_millis(500));
-        let mut step = 0;
-        let mut simulated_price = 500.0;
-        
-        loop {
-            interval.tick().await;
-            step += 1;
-            let change = (step as f64 * 0.015).sin() * 0.5 + 0.15;
-            simulated_price += change;
+    info!("Starting live WebSocket ingestion stream...");
 
-            let tick = TickData {
-                symbol: "NSE:NIFTYBANK-ATM-CE".to_string(),
-                price: simulated_price,
-                volume: 12000 + (step * 10) % 5000,
-                oi: 1500000 + (step * 100) % 20000,
-                timestamp: Utc::now(),
-            };
-
-            match orchestrator.ingest_tick(tick).await {
-                Ok(events) => {
-                    for event in events {
-                        debug!("Engine Event: {:?}", event);
+    // Fetch quotes for initial prev_close cache
+    let http_client = reqwest::Client::new();
+    let symbols: Vec<String> = weights.keys().map(|&s| s.to_string()).collect();
+    info!("Fetching initial quotes for {} constituent stocks...", symbols.len());
+    
+    match http_client.post(&format!("{}/quotes", python_broker_url))
+        .json(&symbols)
+        .send()
+        .await {
+        Ok(res) => {
+            if let Ok(json_res) = res.json::<serde_json::Value>().await {
+                if let Some(data) = json_res.get("data").and_then(|d| d.as_object()) {
+                    for (sym, quote) in data {
+                        let lp = quote.get("last_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
+                        let pc = quote.get("prev_close").and_then(|p| p.as_f64()).unwrap_or(lp);
+                        stock_prices.insert(sym.clone(), (lp, pc));
                     }
+                    info!("Quotes initialized successfully. Total cached: {}", stock_prices.len());
                 }
-                Err(e) => {
-                    error!("Error processing tick step {}: {:?}", step, e);
-                }
-            }
-
-            if step % 20 == 0 {
-                let (trades, pnl) = orchestrator.get_risk_status();
-                info!(
-                    "[STATUS REPORT] Step: {} | Price: {:.2} | Trades Today: {} | Daily PnL: {:.2} | Active Position: {}",
-                    step,
-                    simulated_price,
-                    trades,
-                    pnl,
-                    if orchestrator.active_position().is_some() { "YES" } else { "NO" }
-                );
-            }
-
-            if step >= 200 {
-                info!("Ingested 200 simulation steps. Worker execution completed safely.");
-                break;
             }
         }
-    } else {
-        info!("Starting live WebSocket ingestion stream...");
+        Err(e) => {
+            warn!("Could not fetch stock quotes: {:?}. Base prices will be set dynamically.", e);
+        }
+    }
 
-        // Fetch quotes for initial prev_close cache
-        let http_client = reqwest::Client::new();
-        let symbols: Vec<String> = weights.keys().map(|&s| s.to_string()).collect();
-        info!("Fetching initial quotes for {} constituent stocks...", symbols.len());
-        
-        match http_client.post(&format!("{}/quotes", python_broker_url))
-            .json(&symbols)
-            .send()
-            .await {
-            Ok(res) => {
-                if let Ok(json_res) = res.json::<serde_json::Value>().await {
-                    if let Some(data) = json_res.get("data").and_then(|d| d.as_object()) {
-                        for (sym, quote) in data {
-                            let lp = quote.get("last_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
-                            let pc = quote.get("prev_close").and_then(|p| p.as_f64()).unwrap_or(lp);
-                            stock_prices.insert(sym.clone(), (lp, pc));
+    // Active Option symbols tracking (strike-based)
+    let mut last_subscribed_strike: Option<f64> = None;
+
+    // Connect to local python-broker websocket
+    let ws_url = python_broker_url.replace("http://", "ws://") + "/ws";
+    let mut retry_delay = Duration::from_secs(2);
+
+    loop {
+        info!("Establishing connection to WebSocket bridge at {}...", ws_url);
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((ws_stream, _)) => {
+                info!("WebSocket connection established. Streaming live ticks.");
+                retry_delay = Duration::from_secs(2); // Reset backoff delay
+
+                let (_, mut read) = ws_stream.split();
+                let mut step = 0;
+                let mut last_status_send = std::time::Instant::now();
+                let server_url = std::env::var("SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
+
+                while let Some(message) = read.next().await {
+                    match message {
+                        Ok(msg) => {
+                            if let Ok(text) = msg.into_text() {
+                                if let Ok(ws_tick) = serde_json::from_str::<WsTick>(&text) {
+                                    step += 1;
+                                    
+                                    // 1. Process Stock Constituent updates
+                                    if weights.contains_key(ws_tick.symbol.as_str()) {
+                                        let prev_record = stock_prices.get(&ws_tick.symbol);
+                                        let prev_close = match prev_record {
+                                            Some(&(_, pc)) => pc,
+                                            None => ws_tick.price // Use first price as prev_close base
+                                        };
+                                        stock_prices.insert(ws_tick.symbol.clone(), (ws_tick.price, prev_close));
+
+                                        // Re-calculate the weighted Nifty constituent delta
+                                        let mut weighted_delta = 0.0;
+                                        for (&sym, &weight) in &weights {
+                                            if let Some(&(ltp, pc)) = stock_prices.get(sym) {
+                                                if pc > 0.0 {
+                                                    weighted_delta += weight * (ltp - pc) / pc;
+                                                }
+                                            }
+                                        }
+                                        orchestrator.update_weighted_delta(weighted_delta);
+                                        debug!("Stock constituent tick: {}. Price: {}. New Weighted Delta: {:.6}", 
+                                            ws_tick.symbol, ws_tick.price, weighted_delta);
+                                    }
+
+                                    // 2. Perform Dynamic Strike subscription adjustments
+                                    if ws_tick.symbol == "NSE:NIFTY50-INDEX" {
+                                        let strike = (ws_tick.price / 50.0).round() * 50.0;
+                                        if last_subscribed_strike != Some(strike) {
+                                            let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
+                                                .unwrap_or_else(Utc::now);
+                                            let tick_date = tick_time.naive_utc().date();
+                                            let holidays = price_core::get_nse_holidays_2026();
+                                            let expiry_date = price_core::calculate_nifty_expiry(tick_date, &holidays);
+                                            let suffix = price_core::format_fyers_expiry_suffix(expiry_date);
+                                            let current_expiry_prefix = format!("NSE:NIFTY{}", suffix);
+
+                                            let new_ce = format!("{}{:.0}CE", current_expiry_prefix, strike);
+                                            let new_pe = format!("{}{:.0}PE", current_expiry_prefix, strike);
+                                            
+                                            let client_clone = http_client.clone();
+                                            let url_clone = python_broker_url.clone();
+                                            
+                                            tokio::spawn(async move {
+                                                info!("ATM Strike shift detected! Dynamically subscribing to: CE={}, PE={}", new_ce, new_pe);
+                                                let _ = client_clone.post(&format!("{}/subscribe", url_clone))
+                                                    .json(&serde_json::json!({
+                                                        "symbols": vec![new_ce, new_pe]
+                                                    }))
+                                                    .send()
+                                                    .await;
+                                            });
+                                            
+                                            last_subscribed_strike = Some(strike);
+                                        }
+                                    }
+
+                                    // 3. Filter and pipe active option contracts + index/VIX ticks to Orchestrator
+                                    let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
+                                        .unwrap_or_else(Utc::now);
+                                    let tick_date = tick_time.naive_utc().date();
+                                    let holidays = price_core::get_nse_holidays_2026();
+                                    let expiry_date = price_core::calculate_nifty_expiry(tick_date, &holidays);
+                                    let suffix = price_core::format_fyers_expiry_suffix(expiry_date);
+                                    let current_expiry_prefix = format!("NSE:NIFTY{}", suffix);
+
+                                    let is_active_option = if let Some(strike) = last_subscribed_strike {
+                                        let active_ce = format!("{}{:.0}CE", current_expiry_prefix, strike);
+                                        let active_pe = format!("{}{:.0}PE", current_expiry_prefix, strike);
+                                        ws_tick.symbol == active_ce || ws_tick.symbol == active_pe
+                                    } else {
+                                        false
+                                    };
+
+                                    if ws_tick.symbol == "NSE:NIFTY50-INDEX" || ws_tick.symbol == "NSE:INDIAVIX-INDEX" || is_active_option {
+                                        let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
+                                            .unwrap_or_else(Utc::now);
+                                        let tick = TickData {
+                                            symbol: ws_tick.symbol.clone(),
+                                            price: ws_tick.price,
+                                            volume: ws_tick.volume,
+                                            oi: ws_tick.oi,
+                                            timestamp: tick_time,
+                                        };
+                                        
+                                        match orchestrator.ingest_tick(tick).await {
+                                            Ok(events) => {
+                                                for event in events {
+                                                    debug!("Engine Event: {:?}", event);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Live ingestion step {} error: {:?}", step, e);
+                                            }
+                                        }
+
+                                        // Send status update to server once per second
+                                        if last_status_send.elapsed() >= Duration::from_millis(1000) {
+                                            last_status_send = std::time::Instant::now();
+                                            
+                                            let (prob, conf) = if let Some(ref opt) = orchestrator.last_opportunity {
+                                                (opt.probability, opt.confidence)
+                                            } else {
+                                                (0.0, 0.0)
+                                            };
+                                            
+                                            let decision = format!("{:?}", orchestrator.last_decision.unwrap_or(price_strategy::Decision::Wait));
+                                            let quality = orchestrator.last_quality.as_ref().map(|q| q.total).unwrap_or(0.0);
+                                            let target = orchestrator.last_target_option.clone().unwrap_or_else(|| "--".to_string());
+
+                                            let payload = serde_json::json!({
+                                                "nifty_price": orchestrator.current_nifty_spot,
+                                                "vix": orchestrator.current_vix,
+                                                "ml_confidence": orchestrator.current_ml_confidence,
+                                                "opportunity_confidence": conf,
+                                                "opportunity_probability": prob,
+                                                "decision": decision,
+                                                "quality_score": quality,
+                                                "target_option": target,
+                                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                                            });
+
+                                            let client_clone = http_client.clone();
+                                            let url_clone = format!("{}/live-status", server_url);
+                                            tokio::spawn(async move {
+                                                let _ = client_clone.post(&url_clone)
+                                                    .json(&payload)
+                                                    .send()
+                                                    .await;
+                                            });
+                                        }
+                                    }
+
+                                    // Log status updates periodically
+                                    if step % 100 == 0 {
+                                        let (trades, pnl) = orchestrator.get_risk_status();
+                                        info!(
+                                            "[LIVE STATUS] Ticks Ingested: {} | Active Trades: {} | Daily PnL: {:.2} | Position: {}",
+                                            step,
+                                            trades,
+                                            pnl,
+                                            if orchestrator.active_position().is_some() { "YES" } else { "NO" }
+                                        );
+                                    }
+                                }
+                            }
                         }
-                        info!("Quotes initialized successfully. Total cached: {}", stock_prices.len());
+                        Err(e) => {
+                            error!("Websocket frame read error: {:?}. Reconnecting...", e);
+                            break;
+                        }
                     }
                 }
             }
             Err(e) => {
-                warn!("Could not fetch stock quotes: {:?}. Base prices will be set dynamically.", e);
-            }
-        }
-
-        // Active Option symbols tracking (strike-based)
-        let mut last_subscribed_strike: Option<f64> = None;
-
-        // Connect to local python-broker websocket
-        let ws_url = python_broker_url.replace("http://", "ws://") + "/ws";
-        let mut retry_delay = Duration::from_secs(2);
-
-        loop {
-            info!("Establishing connection to WebSocket bridge at {}...", ws_url);
-            match tokio_tungstenite::connect_async(&ws_url).await {
-                Ok((ws_stream, _)) => {
-                    info!("WebSocket connection established. Streaming live ticks.");
-                    retry_delay = Duration::from_secs(2); // Reset backoff delay
-
-                    let (_, mut read) = ws_stream.split();
-                    let mut step = 0;
-                    let mut last_status_send = std::time::Instant::now();
-                    let server_url = std::env::var("SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
-
-                    while let Some(message) = read.next().await {
-                        match message {
-                            Ok(msg) => {
-                                if let Ok(text) = msg.into_text() {
-                                    if let Ok(ws_tick) = serde_json::from_str::<WsTick>(&text) {
-                                        step += 1;
-                                        
-                                        // 1. Process Stock Constituent updates
-                                        if weights.contains_key(ws_tick.symbol.as_str()) {
-                                            let prev_record = stock_prices.get(&ws_tick.symbol);
-                                            let prev_close = match prev_record {
-                                                Some(&(_, pc)) => pc,
-                                                None => ws_tick.price // Use first price as prev_close base
-                                            };
-                                            stock_prices.insert(ws_tick.symbol.clone(), (ws_tick.price, prev_close));
-
-                                            // Re-calculate the weighted Nifty constituent delta
-                                            let mut weighted_delta = 0.0;
-                                            for (&sym, &weight) in &weights {
-                                                if let Some(&(ltp, pc)) = stock_prices.get(sym) {
-                                                    if pc > 0.0 {
-                                                        weighted_delta += weight * (ltp - pc) / pc;
-                                                    }
-                                                }
-                                            }
-                                            orchestrator.update_weighted_delta(weighted_delta);
-                                            debug!("Stock constituent tick: {}. Price: {}. New Weighted Delta: {:.6}", 
-                                                ws_tick.symbol, ws_tick.price, weighted_delta);
-                                        }
-
-                                        // 2. Perform Dynamic Strike subscription adjustments
-                                        if ws_tick.symbol == "NSE:NIFTY50-INDEX" {
-                                            let strike = (ws_tick.price / 50.0).round() * 50.0;
-                                            if last_subscribed_strike != Some(strike) {
-                                                let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
-                                                    .unwrap_or_else(Utc::now);
-                                                let tick_date = tick_time.naive_utc().date();
-                                                let holidays = price_core::get_nse_holidays_2026();
-                                                let expiry_date = price_core::calculate_nifty_expiry(tick_date, &holidays);
-                                                let suffix = price_core::format_fyers_expiry_suffix(expiry_date);
-                                                let current_expiry_prefix = format!("NSE:NIFTY{}", suffix);
-
-                                                let new_ce = format!("{}{:.0}CE", current_expiry_prefix, strike);
-                                                let new_pe = format!("{}{:.0}PE", current_expiry_prefix, strike);
-                                                
-                                                let client_clone = http_client.clone();
-                                                let url_clone = python_broker_url.clone();
-                                                
-                                                tokio::spawn(async move {
-                                                    info!("ATM Strike shift detected! Dynamically subscribing to: CE={}, PE={}", new_ce, new_pe);
-                                                    let _ = client_clone.post(&format!("{}/subscribe", url_clone))
-                                                        .json(&serde_json::json!({
-                                                            "symbols": vec![new_ce, new_pe]
-                                                        }))
-                                                        .send()
-                                                        .await;
-                                                });
-                                                
-                                                last_subscribed_strike = Some(strike);
-                                            }
-                                        }
-
-                                        // 3. Filter and pipe active option contracts + index/VIX ticks to Orchestrator
-                                        let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
-                                            .unwrap_or_else(Utc::now);
-                                        let tick_date = tick_time.naive_utc().date();
-                                        let holidays = price_core::get_nse_holidays_2026();
-                                        let expiry_date = price_core::calculate_nifty_expiry(tick_date, &holidays);
-                                        let suffix = price_core::format_fyers_expiry_suffix(expiry_date);
-                                        let current_expiry_prefix = format!("NSE:NIFTY{}", suffix);
-
-                                        let is_active_option = if let Some(strike) = last_subscribed_strike {
-                                            let active_ce = format!("{}{:.0}CE", current_expiry_prefix, strike);
-                                            let active_pe = format!("{}{:.0}PE", current_expiry_prefix, strike);
-                                            ws_tick.symbol == active_ce || ws_tick.symbol == active_pe
-                                        } else {
-                                            false
-                                        };
-
-                                        if ws_tick.symbol == "NSE:NIFTY50-INDEX" || ws_tick.symbol == "NSE:INDIAVIX-INDEX" || is_active_option {
-                                            let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
-                                                .unwrap_or_else(Utc::now);
-                                            let tick = TickData {
-                                                symbol: ws_tick.symbol.clone(),
-                                                price: ws_tick.price,
-                                                volume: ws_tick.volume,
-                                                oi: ws_tick.oi,
-                                                timestamp: tick_time,
-                                            };
-                                            
-                                            match orchestrator.ingest_tick(tick).await {
-                                                Ok(events) => {
-                                                    for event in events {
-                                                        debug!("Engine Event: {:?}", event);
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("Live ingestion step {} error: {:?}", step, e);
-                                                }
-                                            }
-
-                                            // Send status update to server once per second
-                                            if last_status_send.elapsed() >= Duration::from_millis(1000) {
-                                                last_status_send = std::time::Instant::now();
-                                                
-                                                let (prob, conf) = if let Some(ref opt) = orchestrator.last_opportunity {
-                                                    (opt.probability, opt.confidence)
-                                                } else {
-                                                    (0.0, 0.0)
-                                                };
-                                                
-                                                let decision = format!("{:?}", orchestrator.last_decision.unwrap_or(price_strategy::Decision::Wait));
-                                                let quality = orchestrator.last_quality.as_ref().map(|q| q.total).unwrap_or(0.0);
-                                                let target = orchestrator.last_target_option.clone().unwrap_or_else(|| "--".to_string());
-
-                                                let payload = serde_json::json!({
-                                                    "nifty_price": orchestrator.current_nifty_spot,
-                                                    "vix": orchestrator.current_vix,
-                                                    "ml_confidence": orchestrator.current_ml_confidence,
-                                                    "opportunity_confidence": conf,
-                                                    "opportunity_probability": prob,
-                                                    "decision": decision,
-                                                    "quality_score": quality,
-                                                    "target_option": target,
-                                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                                });
-
-                                                let client_clone = http_client.clone();
-                                                let url_clone = format!("{}/live-status", server_url);
-                                                tokio::spawn(async move {
-                                                    let _ = client_clone.post(&url_clone)
-                                                        .json(&payload)
-                                                        .send()
-                                                        .await;
-                                                });
-                                            }
-                                        }
-
-                                        // Log status updates periodically
-                                        if step % 100 == 0 {
-                                            let (trades, pnl) = orchestrator.get_risk_status();
-                                            info!(
-                                                "[LIVE STATUS] Ticks Ingested: {} | Active Trades: {} | Daily PnL: {:.2} | Position: {}",
-                                                step,
-                                                trades,
-                                                pnl,
-                                                if orchestrator.active_position().is_some() { "YES" } else { "NO" }
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Websocket frame read error: {:?}. Reconnecting...", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("WebSocket connection failed: {:?}. Retrying in {:?}...", e, retry_delay);
-                    time::sleep(retry_delay).await;
-                    // Exponential backoff
-                    retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
-                }
+                error!("WebSocket connection failed: {:?}. Retrying in {:?}...", e, retry_delay);
+                time::sleep(retry_delay).await;
+                // Exponential backoff
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
             }
         }
     }

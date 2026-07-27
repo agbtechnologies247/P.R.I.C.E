@@ -521,12 +521,11 @@ async fn index_handler() -> Html<&'static str> {
                     </select>
                 </div>
                 <div class="form-group" style="margin-bottom: 0.75rem;">
-                    <label for="download-symbol-input">Select / Enter Symbol</label>
-                    <input list="download-symbols-list" id="download-symbol-input" class="input-text" style="background-color: #121824; border: 1px solid var(--border-color); color: var(--text-main); width: 100%; padding: 0.5rem; border-radius: 4px;" value="NSE:NIFTY50-INDEX" placeholder="e.g. NSE:NIFTY50-INDEX">
-                    <datalist id="download-symbols-list">
-                        <option value="NSE:NIFTY50-INDEX">
-                        <option value="NSE:INDIAVIX-INDEX">
-                    </datalist>
+                    <label for="download-symbol-select">Select Symbol</label>
+                    <select id="download-symbol-select" class="input-text" style="background-color: #121824; border: 1px solid var(--border-color); color: var(--text-main); width: 100%; padding: 0.5rem; border-radius: 4px;">
+                        <option value="NSE:NIFTY50-INDEX">NSE:NIFTY50-INDEX</option>
+                        <option value="NSE:INDIAVIX-INDEX">NSE:INDIAVIX-INDEX</option>
+                    </select>
                 </div>
                 <div id="downloader-info-box" style="margin: 1rem 0; padding: 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color);">
                     <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between; margin-bottom: 0.25rem;">
@@ -764,7 +763,7 @@ async fn index_handler() -> Html<&'static str> {
 
         // Downloader Logic
         const yearSelect = document.getElementById('download-year-select');
-        const symbolInput = document.getElementById('download-symbol-input');
+        const symbolSelect = document.getElementById('download-symbol-select');
         const statusVal = document.getElementById('downloader-status-val');
         const progressVal = document.getElementById('downloader-progress-val');
         const timeVal = document.getElementById('downloader-time-val');
@@ -783,8 +782,7 @@ async fn index_handler() -> Html<&'static str> {
         }
 
         async function checkDownloadStatus() {
-            const year = yearSelect.value;
-            const symbol = symbolInput.value.trim();
+            const symbol = symbolSelect.value;
             if (!symbol) return;
             try {
                 const res = await fetch(`/database/download-status?year=${year}&symbol=${encodeURIComponent(symbol)}`);
@@ -838,8 +836,7 @@ async fn index_handler() -> Html<&'static str> {
         }
 
         async function startDataCollection() {
-            const year = yearSelect.value;
-            const symbol = symbolInput.value.trim();
+            const symbol = symbolSelect.value;
             if (!symbol) return;
             actionBtn.disabled = true;
             actionBtn.textContent = 'Starting...';
@@ -958,8 +955,7 @@ async fn index_handler() -> Html<&'static str> {
         }
 
         async function fetchCandlesPreview() {
-            const year = yearSelect.value;
-            const symbol = symbolInput.value.trim();
+            const symbol = symbolSelect.value;
             if (!symbol) return;
             try {
                 const res = await fetch(`/database/candles-preview?symbol=${encodeURIComponent(symbol)}&year=${year}`);
@@ -996,7 +992,7 @@ async fn index_handler() -> Html<&'static str> {
             checkDownloadStatus();
             fetchCandlesPreview();
         });
-        symbolInput.addEventListener('change', () => {
+        symbolSelect.addEventListener('change', () => {
             if (statusPollInterval) {
                 clearInterval(statusPollInterval);
                 statusPollInterval = null;
@@ -1236,15 +1232,28 @@ async fn download_status_handler(
     let expected_count = expected_days.len() as i64;
     let completed_count = get_completed_jobs_count(&state.db.pool, &symbol, year).await.unwrap_or(0);
     
-    let total_jobs_in_db = get_downloaded_dates(&state.db.pool, &symbol, year).await.unwrap_or_default().len() as i64;
+    let active_count = sqlx::query(
+        "SELECT count(*) as count 
+         FROM download_jobs 
+         WHERE symbol = $1 
+           AND EXTRACT(YEAR FROM from_date)::integer = $2 
+           AND (status = 'PENDING' OR status = 'IN_PROGRESS')"
+    )
+    .bind(&symbol)
+    .bind(year)
+    .fetch_one(&state.db.pool)
+    .await
+    .map(|r| r.get::<i64, _>("count"))
+    .unwrap_or(0);
 
     let (status, time_remaining) = if completed_count >= expected_count {
         ("COMPLETED".to_string(), "00:00".to_string())
-    } else {
-        let st = if total_jobs_in_db > 0 { "IN_PROGRESS".to_string() } else { "NOT_STARTED".to_string() };
+    } else if active_count > 0 {
         let remaining_days = expected_count - completed_count;
         let seconds = remaining_days * 5;
-        (st, format_time_remaining(seconds))
+        ("IN_PROGRESS".to_string(), format_time_remaining(seconds))
+    } else {
+        ("NOT_STARTED".to_string(), "00:00".to_string())
     };
 
     Json(serde_json::json!({
@@ -1264,21 +1273,19 @@ async fn start_download_handler(
     let symbol = payload.symbol;
 
     let expected_days = get_trading_days(year);
-    let mut downloaded_dates = get_downloaded_dates(&state.db.pool, &symbol, year).await.unwrap_or_default();
 
     for date in expected_days {
-        if !downloaded_dates.contains(&date) {
-            let _ = sqlx::query(
-                "INSERT INTO download_jobs (symbol, from_date, to_date, status) 
-                 VALUES ($1, $2, $2, 'PENDING') 
-                 ON CONFLICT (symbol, from_date, to_date) DO NOTHING"
-            )
-            .bind(&symbol)
-            .bind(date)
-            .execute(&state.db.pool)
-            .await;
-            downloaded_dates.insert(date);
-        }
+        let _ = sqlx::query(
+            "INSERT INTO download_jobs (symbol, from_date, to_date, status, last_updated) 
+             VALUES ($1, $2, $2, 'PENDING', NOW()) 
+             ON CONFLICT (symbol, from_date, to_date) DO UPDATE
+             SET status = CASE WHEN download_jobs.status = 'COMPLETED' THEN 'COMPLETED' ELSE 'PENDING' END,
+                 last_updated = CASE WHEN download_jobs.status = 'COMPLETED' THEN download_jobs.last_updated ELSE NOW() END"
+        )
+        .bind(&symbol)
+        .bind(date)
+        .execute(&state.db.pool)
+        .await;
     }
 
     Json(serde_json::json!({
@@ -1457,7 +1464,10 @@ async fn start_background_downloader(db: TimescaleClient, python_broker_url: Str
                 "SELECT symbol, from_date, to_date 
                  FROM download_jobs 
                  WHERE status = 'PENDING' OR status LIKE 'FAILED%' 
-                 ORDER BY last_updated ASC 
+                 ORDER BY 
+                   CASE WHEN status = 'PENDING' THEN 0 ELSE 1 END,
+                   CASE WHEN status = 'PENDING' THEN last_updated END DESC,
+                   last_updated ASC
                  LIMIT 1"
             )
             .fetch_optional(&db.pool)
