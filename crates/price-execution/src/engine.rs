@@ -231,7 +231,16 @@ impl ExecutionOrchestrator {
             } else {
                 format!("{}{:.0}PE", prefix, strike)
             };
-            self.last_target_option = Some(target_symbol);
+            self.last_target_option = Some(target_symbol.clone());
+
+            // Update option spread dynamically (throttled to once every 5 seconds)
+            if tick.timestamp.timestamp() % 5 == 0 {
+                if let Ok(quotes) = self.broker.quotes(vec![target_symbol.clone()]).await {
+                    if let Some(q) = quotes.first() {
+                        self.current_spread = (q.ask - q.bid).abs().max(0.05);
+                    }
+                }
+            }
 
             // 7. Evaluates Entry rules
             let oi_increasing = tick.volume > 5000; 
@@ -303,9 +312,9 @@ impl ExecutionOrchestrator {
                 self.current_spread,
                 &geometry,
                 oi_increasing,
-                0.10, // Slippage
+                self.current_spread, // Slippage
                 3.0,  // Reward-risk ratio
-                0.65, // ML win rate
+                self.current_ml_confidence / 100.0, // ML win rate
             );
             self.last_quality = Some(quality.clone());
 
