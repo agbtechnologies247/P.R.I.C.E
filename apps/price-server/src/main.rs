@@ -783,7 +783,8 @@ async fn index_handler() -> Html<&'static str> {
 
         async function checkDownloadStatus() {
             const symbol = symbolSelect.value;
-            if (!symbol) return;
+            const year = yearSelect.value;
+            if (!symbol || !year) return;
             try {
                 const res = await fetch(`/database/download-status?year=${year}&symbol=${encodeURIComponent(symbol)}`);
                 const data = await res.json();
@@ -837,7 +838,8 @@ async fn index_handler() -> Html<&'static str> {
 
         async function startDataCollection() {
             const symbol = symbolSelect.value;
-            if (!symbol) return;
+            const year = yearSelect.value;
+            if (!symbol || !year) return;
             actionBtn.disabled = true;
             actionBtn.textContent = 'Starting...';
             try {
@@ -956,7 +958,8 @@ async fn index_handler() -> Html<&'static str> {
 
         async function fetchCandlesPreview() {
             const symbol = symbolSelect.value;
-            if (!symbol) return;
+            const year = yearSelect.value;
+            if (!symbol || !year) return;
             try {
                 const res = await fetch(`/database/candles-preview?symbol=${encodeURIComponent(symbol)}&year=${year}`);
                 const data = await res.json();
