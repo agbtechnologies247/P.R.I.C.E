@@ -51,6 +51,9 @@ impl ReplayRunner {
         if spot_candles.is_empty() {
             anyhow::bail!("No historical candles found for {} in TimescaleDB between {} and {}", symbol, from_date, to_date);
         }
+        if vix_candles.is_empty() {
+            anyhow::bail!("No historical VIX candles found in TimescaleDB between {} and {}", from_date, to_date);
+        }
 
         tracing::info!("Loaded {} spot candles and {} VIX candles.", spot_candles.len(), vix_candles.len());
 
@@ -85,7 +88,7 @@ impl ReplayRunner {
         let mut peak_equity = initial_capital;
         let mut max_drawdown = 0.0;
         
-        let mut last_vix = 15.0;
+        let mut last_vix = vix_candles.first().map(|c| c.close).unwrap_or(0.0);
         let mut daily_equities = Vec::new();
         let mut last_date: Option<NaiveDate> = None;
 
@@ -308,9 +311,14 @@ mod tests {
         let _ = client.insert_candles("NSE:NIFTY50-INDEX", "NSE", "1m", &spot_candles).await;
         let _ = client.insert_candles("NSE:INDIAVIX-INDEX", "NSE", "1m", &vix_candles).await;
 
-        let runner = ReplayRunner::new(client);
+        let runner = ReplayRunner::new(client.clone());
         let output_dir = "./target/debug/test_results";
         let res = runner.run_backtest("NSE:NIFTY50-INDEX", date, date, 100000.0, output_dir).await;
+        
+        // Cleanup synthetic test candles from database
+        let _ = sqlx::query("DELETE FROM candles WHERE symbol IN ('NSE:NIFTY50-INDEX', 'NSE:INDIAVIX-INDEX')")
+            .execute(&client.pool)
+            .await;
         
         assert!(res.is_ok(), "Backtest run failed: {:?}", res.err());
         let report = res.unwrap();

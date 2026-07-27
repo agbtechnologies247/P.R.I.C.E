@@ -86,65 +86,6 @@ impl ReplayBroker {
     }
 }
 
-// Black-Scholes & Error Function approximations for theoretical options pricing
-fn erf(x: f64) -> f64 {
-    let a1 =  0.254829592;
-    let a2 = -0.284496736;
-    let a3 =  1.421413741;
-    let a4 = -1.453152027;
-    let a5 =  1.061405429;
-    let p  =  0.3275911;
-
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x_abs = x.abs();
-
-    let t = 1.0 / (1.0 + p * x_abs);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x_abs * x_abs).exp();
-
-    sign * y
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + erf(x / 2.0f64.sqrt()))
-}
-
-fn black_scholes(s: f64, k: f64, t: f64, r: f64, sigma: f64, is_call: bool) -> f64 {
-    if t <= 0.0 {
-        if is_call {
-            return (s - k).max(0.0);
-        } else {
-            return (k - s).max(0.0);
-        }
-    }
-
-    let d1 = ((s / k).ln() + (r + 0.5 * sigma * sigma) * t) / (sigma * t.sqrt());
-    let d2 = d1 - sigma * t.sqrt();
-
-    if is_call {
-        s * normal_cdf(d1) - k * (-r * t).exp() * normal_cdf(d2)
-    } else {
-        k * (-r * t).exp() * normal_cdf(-d2) - s * normal_cdf(-d1)
-    }
-}
-
-fn parse_option_symbol(symbol: &str) -> Option<(f64, bool)> {
-    if !symbol.starts_with("NSE:NIFTY") {
-        return None;
-    }
-    let remaining = &symbol[9..];
-    if remaining.len() < 7 {
-        return None;
-    }
-    let details = &remaining[5..];
-    let is_call = details.ends_with("CE");
-    let is_put = details.ends_with("PE");
-    if !is_call && !is_put {
-        return None;
-    }
-    let strike_str = &details[..details.len() - 2];
-    let strike = strike_str.parse::<f64>().ok()?;
-    Some((strike, is_call))
-}
 
 #[async_trait]
 impl Broker for ReplayBroker {
@@ -298,7 +239,7 @@ impl Broker for ReplayBroker {
         for sym in symbols {
             if let Some(q) = self.current_prices.get(&sym) {
                 quotes.push(q.value().clone());
-            } else if let Some((strike, is_call)) = parse_option_symbol(&sym) {
+            } else {
                 let current_time = {
                     let t_guard = self.current_time.lock().unwrap();
                     *t_guard
@@ -314,43 +255,11 @@ impl Broker for ReplayBroker {
                     }
                 }
 
-                if price.is_none() {
-                    let tick_date = current_time.naive_utc().date();
-                    let downloader = crate::downloader::HistoricalDownloader::new(
-                        &self.python_broker_url,
-                        self.db.clone(),
-                    );
-                    if let Err(e) = downloader.download_history(&sym, "NSE", tick_date, tick_date).await {
-                        tracing::warn!("On-the-fly option download failed for {}: {:?}", sym, e);
-                    } else if let Ok(candles) = self.db.get_candles(&sym, "1m", start_range, end_range).await {
-                        if let Some(c) = candles.first() {
-                            price = Some(c.close);
-                        }
-                    }
-                }
-
                 let final_price = if let Some(p) = price {
                     p
                 } else {
-                    let spot = self.current_prices.get("NSE:NIFTY50-INDEX")
-                        .map(|q| q.last_price)
-                        .unwrap_or(24000.0);
-                    let vix = self.current_prices.get("NSE:INDIAVIX-INDEX")
-                        .map(|q| q.last_price)
-                        .unwrap_or(15.0);
-                    let current_date = current_time.naive_utc().date();
-                    let holidays = price_core::get_nse_holidays_2026();
-                    let expiry_date = price_core::calculate_nifty_expiry(current_date, &holidays);
-                    let expiry_datetime = expiry_date.and_hms_opt(15, 30, 0)
-                        .unwrap()
-                        .and_local_timezone(Utc)
-                        .unwrap();
-                    let diff_sec = (expiry_datetime - current_time).num_seconds().max(0);
-                    let t_years = diff_sec as f64 / (365.0 * 24.0 * 3600.0);
-                    let sigma = vix / 100.0;
-                    let r = 0.07;
-                    black_scholes(spot, strike, t_years, r, sigma, is_call)
-                }.max(0.05);
+                    return Err(PriceError::SymbolNotFound(sym));
+                };
 
                 let bid = final_price * (1.0 - self.slippage_pct);
                 let ask = final_price * (1.0 + self.slippage_pct);
@@ -363,16 +272,6 @@ impl Broker for ReplayBroker {
                     volume: 5000,
                     oi: 100000,
                     prev_close: final_price,
-                });
-            } else {
-                quotes.push(Quote {
-                    symbol: sym,
-                    last_price: 500.0,
-                    bid: 499.90,
-                    ask: 500.10,
-                    volume: 1000,
-                    oi: 10000,
-                    prev_close: 500.0,
                 });
             }
         }
