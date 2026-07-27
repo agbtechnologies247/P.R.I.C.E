@@ -514,6 +514,7 @@ async fn index_handler() -> Html<&'static str> {
         <div>
             <div class="card">
                 <div class="card-title">Historical Data Downloader</div>
+                <div id="downloader-alert-box" style="display: none; padding: 0.75rem; border-radius: 6px; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); margin-bottom: 0.75rem; font-size: 0.8rem; color: #fca5a5; line-height: 1.4;"></div>
                 <div class="form-group" style="margin-bottom: 0.75rem;">
                     <label for="download-year-select">Select Year</label>
                     <select id="download-year-select" class="input-text" style="background-color: #121824; border: 1px solid var(--border-color); color: var(--text-main); width: 100%; padding: 0.5rem; border-radius: 4px;">
@@ -932,6 +933,11 @@ async fn index_handler() -> Html<&'static str> {
                 const res = await fetch('/database/jobs');
                 const data = await res.json();
                 const tbody = document.querySelector('#pipeline-jobs-table tbody');
+                const alertBox = document.getElementById('downloader-alert-box');
+                
+                let showPermissionAlert = false;
+                let permissionAlertMessage = "";
+                
                 if (data.status === 'success' && data.jobs && data.jobs.length > 0) {
                     tbody.innerHTML = '';
                     data.jobs.forEach(j => {
@@ -939,7 +945,13 @@ async fn index_handler() -> Html<&'static str> {
                         let statusColor = 'var(--text-muted)';
                         if (j.status === 'COMPLETED') statusColor = 'var(--success)';
                         else if (j.status === 'IN_PROGRESS') statusColor = 'var(--warning)';
-                        else if (j.status.startsWith('FAILED')) statusColor = 'var(--danger)';
+                        else if (j.status.startsWith('FAILED')) {
+                            statusColor = 'var(--danger)';
+                            if (j.status.includes("Additional permission required") || j.status.includes("permission") || j.status.includes("-15") || j.status.includes("-17")) {
+                                showPermissionAlert = true;
+                                permissionAlertMessage = j.status;
+                            }
+                        }
                         
                         row.innerHTML = `
                             <td style="padding: 0.5rem; font-size: 0.8rem;"><strong>${j.symbol}</strong></td>
@@ -950,6 +962,26 @@ async fn index_handler() -> Html<&'static str> {
                     });
                 } else {
                     tbody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: var(--text-muted); padding: 0.75rem; font-size: 0.8rem;">No active pipeline jobs</td></tr>';
+                }
+                
+                if (showPermissionAlert) {
+                    alertBox.style.display = 'block';
+                    alertBox.innerHTML = `
+                        <strong style="color: var(--danger); font-size: 0.85rem;">⚠️ Fyers API Access Blocked</strong><br>
+                        <span style="font-size: 0.75rem; color: #f87171; display: block; margin: 0.25rem 0;">
+                            ${permissionAlertMessage}
+                        </span>
+                        <div style="margin-top: 0.5rem; border-top: 1px solid rgba(239, 68, 68, 0.2); padding-top: 0.5rem;">
+                            <strong>How to fix:</strong>
+                            <ol style="margin: 0.25rem 0 0 1rem; padding: 0; font-size: 0.75rem; line-height: 1.4;">
+                                <li>Open <a href="https://myapi.fyers.in/" target="_blank" style="color: #818cf8; text-decoration: underline; font-weight: bold;">myapi.fyers.in</a> and log in.</li>
+                                <li>Edit your App settings and check the <strong>Data API</strong> (Historical Data) permission.</li>
+                                <li>Save settings, then copy a new <strong>Auth Code</strong> using step 1 & 2 in the Activation panel below and click <strong>Generate & Save Token</strong>.</li>
+                            </ol>
+                        </div>
+                    `;
+                } else {
+                    alertBox.style.display = 'none';
                 }
             } catch (e) {
                 console.error("Failed to fetch jobs: ", e);

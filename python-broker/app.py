@@ -139,8 +139,29 @@ def get_history(req: HistoryRequest):
                     print(f"SQLite writing cache failed: {e}")
             return {"status": "success", "data": {"candles": candles}}
         else:
+            err_code = res.get("code")
             detail = res.get("message", "Unknown error from Fyers history API")
-            raise HTTPException(status_code=400, detail=f"Fyers history query failed: {detail}")
+            
+            # Fyers API Error Codes Mapping
+            COMMON_ERRORS = {
+                -8: "Token is Expired. Please regenerate the token.",
+                -15: "Invalid token. Please regenerate the token.",
+                -16: "Server unable to authenticate token. Please authenticate again.",
+                -17: "Token is Invalid or Expired. Please authenticate again.",
+                -50: "Invalid parameters passed to Fyers API.",
+                -300: "Invalid symbol provided.",
+                -352: "Invalid App ID provided.",
+                -429: "Fyers API rate limit exceeded.",
+            }
+            friendly_desc = COMMON_ERRORS.get(err_code)
+            if friendly_desc:
+                error_msg = f"{detail} (Code {err_code}: {friendly_desc})"
+            elif err_code is not None:
+                error_msg = f"{detail} (Code {err_code})"
+            else:
+                error_msg = detail
+                
+            raise HTTPException(status_code=400, detail=f"Fyers history query failed: {error_msg}")
     except HTTPException:
         raise
     except Exception as e:
