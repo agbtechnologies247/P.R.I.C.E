@@ -258,7 +258,7 @@ impl Broker for ReplayBroker {
                 let final_price = if let Some(p) = price {
                     p
                 } else {
-                    return Err(PriceError::SymbolNotFound(sym));
+                    return Err(PriceError::BrokerError(format!("Symbol not found in database: {}", sym)));
                 };
 
                 let bid = final_price * (1.0 - self.slippage_pct);

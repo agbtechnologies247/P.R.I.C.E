@@ -59,7 +59,7 @@ impl ReplayRunner {
 
         // Map VIX candles by timestamp for quick lookup
         let mut vix_map = std::collections::HashMap::new();
-        for vc in vix_candles {
+        for vc in &vix_candles {
             vix_map.insert(vc.timestamp, vc.close);
         }
 
@@ -316,9 +316,7 @@ mod tests {
         let res = runner.run_backtest("NSE:NIFTY50-INDEX", date, date, 100000.0, output_dir).await;
         
         // Cleanup synthetic test candles from database
-        let _ = sqlx::query("DELETE FROM candles WHERE symbol IN ('NSE:NIFTY50-INDEX', 'NSE:INDIAVIX-INDEX')")
-            .execute(&client.pool)
-            .await;
+        let _ = client.delete_candles(&["NSE:NIFTY50-INDEX", "NSE:INDIAVIX-INDEX"]).await;
         
         assert!(res.is_ok(), "Backtest run failed: {:?}", res.err());
         let report = res.unwrap();

@@ -172,4 +172,12 @@ impl TimescaleClient {
             .map(|r| (r.get::<String, _>("symbol"), r.get::<i64, _>("count")))
             .collect())
     }
+
+    pub async fn delete_candles(&self, symbols: &[&str]) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM candles WHERE symbol = ANY($1)")
+            .bind(symbols)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
