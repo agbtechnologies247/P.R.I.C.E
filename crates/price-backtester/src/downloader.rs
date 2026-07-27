@@ -32,6 +32,9 @@ impl HistoricalDownloader {
             symbol, total_segments
         );
 
+        let mut any_failed = false;
+        let mut last_error = None;
+
         for (idx, (seg_start, seg_end)) in segments.into_iter().enumerate() {
             let seg_start_str = seg_start.format("%Y-%m-%d").to_string();
             let seg_end_str = seg_end.format("%Y-%m-%d").to_string();
@@ -80,6 +83,8 @@ impl HistoricalDownloader {
                             tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
                         } else {
                             self.db.mark_job_status(symbol, seg_start, seg_end, &format!("FAILED: {}", e)).await?;
+                            any_failed = true;
+                            last_error = Some(e);
                         }
                     }
                 }
@@ -89,6 +94,10 @@ impl HistoricalDownloader {
             if idx + 1 < total_segments && success {
                 tokio::time::sleep(tokio::time::Duration::from_millis(5000)).await;
             }
+        }
+
+        if any_failed {
+            anyhow::bail!("Historical downloader execution had segment failures. Last error: {:?}", last_error);
         }
 
         Ok(())

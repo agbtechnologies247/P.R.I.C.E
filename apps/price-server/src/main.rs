@@ -1408,11 +1408,10 @@ fn get_trading_days(year: i32) -> Vec<chrono::NaiveDate> {
 
 async fn get_completed_jobs_count(pool: &sqlx::PgPool, symbol: &str, year: i32) -> anyhow::Result<i64> {
     let row = sqlx::query(
-        "SELECT count(*) as count 
-         FROM download_jobs 
+        "SELECT count(distinct (timestamp::date)) as count 
+         FROM candles 
          WHERE symbol = $1 
-           AND EXTRACT(YEAR FROM from_date)::integer = $2 
-           AND status = 'COMPLETED'"
+           AND EXTRACT(YEAR FROM timestamp)::integer = $2"
     )
     .bind(symbol)
     .bind(year)
