@@ -25,10 +25,10 @@ impl HistoricalDownloader {
         from_date: NaiveDate,
         to_date: NaiveDate,
     ) -> anyhow::Result<()> {
-        let segments = partition_date_range(from_date, to_date, 1);
+        let segments = partition_date_range(from_date, to_date, 7);
         let total_segments = segments.len();
         tracing::info!(
-            "Partitioned historical download request for {} into {} segments of 1 day.",
+            "Partitioned historical download request for {} into {} weekly segments.",
             symbol, total_segments
         );
 
@@ -147,6 +147,12 @@ impl HistoricalDownloader {
                         let ts_epoch = c_arr[0].as_f64().unwrap_or(0.0) as i64;
                         let timestamp = chrono::DateTime::<Utc>::from_timestamp(ts_epoch, 0)
                             .unwrap_or_else(|| Utc::now());
+
+                        // Validate market session hours
+                        if !price_core::is_indian_market_hours(timestamp) {
+                            continue;
+                        }
+
                         let open = c_arr[1].as_f64().unwrap_or(0.0);
                         let high = c_arr[2].as_f64().unwrap_or(0.0);
                         let low = c_arr[3].as_f64().unwrap_or(0.0);

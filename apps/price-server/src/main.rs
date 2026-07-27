@@ -1272,23 +1272,47 @@ async fn start_download_handler(
     Extension(state): Extension<Arc<AppState>>,
     Json(payload): Json<StartParams>,
 ) -> impl IntoResponse {
+    use chrono::Datelike;
     let year = payload.year;
     let symbol = payload.symbol;
 
-    let expected_days = get_trading_days(year);
+    // Delete any existing download jobs for the symbol and year to start clean
+    let _ = sqlx::query(
+        "DELETE FROM download_jobs 
+         WHERE symbol = $1 
+           AND EXTRACT(YEAR FROM from_date)::integer = $2"
+    )
+    .bind(&symbol)
+    .bind(year)
+    .execute(&state.db.pool)
+    .await;
 
-    for date in expected_days {
+    let start_date = chrono::NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
+    let now = chrono::Utc::now().naive_utc().date();
+    let end_date = if year == now.year() {
+        now
+    } else {
+        chrono::NaiveDate::from_ymd_opt(year, 12, 31).unwrap()
+    };
+
+    let mut current_start = start_date;
+    while current_start <= end_date {
+        let current_end = (current_start + chrono::Duration::days(6)).min(end_date);
+        
         let _ = sqlx::query(
             "INSERT INTO download_jobs (symbol, from_date, to_date, status, last_updated) 
-             VALUES ($1, $2, $2, 'PENDING', NOW()) 
+             VALUES ($1, $2, $3, 'PENDING', NOW()) 
              ON CONFLICT (symbol, from_date, to_date) DO UPDATE
              SET status = CASE WHEN download_jobs.status = 'COMPLETED' THEN 'COMPLETED' ELSE 'PENDING' END,
                  last_updated = CASE WHEN download_jobs.status = 'COMPLETED' THEN download_jobs.last_updated ELSE NOW() END"
         )
         .bind(&symbol)
-        .bind(date)
+        .bind(current_start)
+        .bind(current_end)
         .execute(&state.db.pool)
         .await;
+
+        current_start = current_end + chrono::Duration::days(1);
     }
 
     Json(serde_json::json!({
