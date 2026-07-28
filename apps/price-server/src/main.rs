@@ -29,7 +29,7 @@ struct LiveStatusInfo {
 }
 
 struct AppState {
-    broker: Arc<price_broker::HybridBroker>,
+    broker: Arc<dyn price_broker::Broker>,
     python_broker_url: String,
     db: TimescaleClient,
     live_status: RwLock<Option<LiveStatusInfo>>,
@@ -47,8 +47,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let python_broker_url = std::env::var("PYTHON_BROKER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
 
-    // 2. Setup Hybrid broker client (executing both Live & Paper)
-    let broker = Arc::new(price_broker::HybridBroker::new(&python_broker_url, 10000.0));
+    // 2. Setup Broker
+    let broker: Arc<dyn price_broker::Broker> = if let Ok(delta_key) = std::env::var("DELTA_API_KEY") {
+        let delta_secret = std::env::var("DELTA_API_SECRET").unwrap_or_default();
+        let delta_url = std::env::var("DELTA_BASE_URL").unwrap_or_else(|_| "https://api.delta.exchange".to_string());
+        info!("Initializing DeltaExchangeClient with API Key: {}...", delta_key);
+        Arc::new(price_broker::DeltaExchangeClient::new(&delta_url, Some(delta_key), Some(delta_secret)))
+    } else {
+        info!("Initializing HybridBroker (simultaneous Live + Paper trading)...");
+        Arc::new(price_broker::HybridBroker::new(&python_broker_url, 10000.0))
+    };
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5433/price".to_string());
@@ -81,6 +89,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/database/download-status", get(download_status_handler))
         .route("/database/start-download", post(start_download_handler))
         .route("/database/download", get(download_handler))
+        .route("/database/symbol-mappings", get(symbol_mappings_handler))
+        .route("/journals/trade", get(journals_trade_handler))
+        .route("/journals/decision", get(journals_decision_handler))
+        .route("/journals/risk", get(journals_risk_handler))
+        .route("/journals/ml", get(journals_ml_handler))
+        .route("/research/performance", get(research_performance_handler))
         .route("/metrics", get(metrics_handler))
         .layer(Extension(state));
 
@@ -360,6 +374,38 @@ async fn index_handler() -> Html<&'static str> {
             background-color: var(--warning);
             box-shadow: 0 0 10px var(--warning);
         }
+        .nav-tabs {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 0.5rem;
+        }
+
+        .nav-tab {
+            padding: 0.6rem 1.25rem;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            color: var(--text-muted);
+            background: transparent;
+            border: 1px solid transparent;
+            transition: all 0.2s ease;
+        }
+
+        .nav-tab.active {
+            color: white;
+            background: rgba(99, 102, 241, 0.15);
+            border-color: var(--primary);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
     </style>
 </head>
 <body>
@@ -367,14 +413,14 @@ async fn index_handler() -> Html<&'static str> {
     <header>
         <div>
             <h1>P.R.I.C.E</h1>
-            <p style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem;">Predictive Risk Intelligence & Capital Engine</p>
+            <p style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.25rem;">Predictive Risk Intelligence & Capital Engine (Multi-Broker Enterprise)</p>
         </div>
 
         <!-- Live Ticker Header -->
         <div style="display: flex; gap: 2rem; align-items: center; background: rgba(20, 26, 46, 0.8); border: 1px solid var(--border-color); padding: 0.6rem 1.5rem; border-radius: 12px; backdrop-filter: blur(8px); box-shadow: 0 4px 20px rgba(0,0,0,0.2);">
             <div style="display: flex; align-items: center; gap: 0.5rem;">
                 <span class="live-pulse" id="nifty-pulse-dot" style="background-color: var(--danger); box-shadow: 0 0 10px var(--danger);"></span>
-                <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600; letter-spacing: 0.05em;">NIFTY SPOT:</span>
+                <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600; letter-spacing: 0.05em;">NIFTY / CRYPTO:</span>
                 <span style="font-size: 1.15rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--text-main);" id="live-nifty-val">₹0.00</span>
             </div>
             <div style="width: 1px; height: 20px; background: var(--border-color);"></div>
@@ -390,227 +436,458 @@ async fn index_handler() -> Html<&'static str> {
         </div>
     </header>
 
-    <div class="grid-container">
-        <!-- Main Column -->
-        <div>
-            <!-- Live Opportunity Section -->
-            <div class="card" style="border-left: 4px solid var(--primary);">
-                <div class="card-title">
-                    <span>Live Opportunity & Quantitative Decision Engine</span>
-                    <span id="last-update-time" style="font-size: 0.75rem; color: var(--danger); font-weight: 600; letter-spacing: 0.05em; background: rgba(239, 68, 68, 0.1); padding: 0.2rem 0.6rem; border-radius: 4px;">Worker offline</span>
-                </div>
-                <div class="metrics-grid" style="margin-bottom: 1.5rem;">
-                    <div class="metric-card" style="padding: 1rem;">
-                        <div class="metric-label">Target Option Contract</div>
-                        <div class="metric-value highlight" style="font-size: 1.4rem; font-family: 'Space Grotesk', sans-serif;" id="opp-target-option">--</div>
+    <!-- Navigation Tabs -->
+    <div class="nav-tabs">
+        <button class="nav-tab active" onclick="switchTab('tab-live')">📈 Live Dashboard</button>
+        <button class="nav-tab" onclick="switchTab('tab-journals')">📔 Enterprise Journals</button>
+        <button class="nav-tab" onclick="switchTab('tab-research')">🔬 Research & Analytics</button>
+        <button class="nav-tab" onclick="switchTab('tab-symbols')">⚙️ Symbol Mappings & Crypto</button>
+        <button class="nav-tab" onclick="switchTab('tab-downloader')">📥 Data Downloader</button>
+    </div>
+
+    <!-- TAB 1: Live Dashboard -->
+    <div id="tab-live" class="tab-content active">
+        <div class="grid-container">
+            <div>
+                <!-- Live Opportunity Section -->
+                <div class="card" style="border-left: 4px solid var(--primary);">
+                    <div class="card-title">
+                        <span>Live Opportunity & Quantitative Decision Pipeline</span>
+                        <span id="last-update-time" style="font-size: 0.75rem; color: var(--danger); font-weight: 600; letter-spacing: 0.05em; background: rgba(239, 68, 68, 0.1); padding: 0.2rem 0.6rem; border-radius: 4px;">Worker offline</span>
                     </div>
-                    <div class="metric-card" style="padding: 1rem;">
-                        <div class="metric-label">Engine Decision</div>
-                        <div style="margin-top: 0.4rem; display: flex; justify-content: center;">
-                            <span id="opp-decision-badge" class="status-badge badge-wait" style="display: inline-flex; justify-content: center; width: 120px;">WAIT</span>
+                    <div class="metrics-grid" style="margin-bottom: 1.5rem;">
+                        <div class="metric-card" style="padding: 1rem;">
+                            <div class="metric-label">Target Symbol / Contract</div>
+                            <div class="metric-value highlight" style="font-size: 1.4rem; font-family: 'Space Grotesk', sans-serif;" id="opp-target-option">--</div>
+                        </div>
+                        <div class="metric-card" style="padding: 1rem;">
+                            <div class="metric-label">Pipeline Decision</div>
+                            <div style="margin-top: 0.4rem; display: flex; justify-content: center;">
+                                <span id="opp-decision-badge" class="status-badge badge-wait" style="display: inline-flex; justify-content: center; width: 120px;">WAIT</span>
+                            </div>
+                        </div>
+                        <div class="metric-card" style="padding: 1rem;">
+                            <div class="metric-label">Trade Quality Score</div>
+                            <div class="metric-value" id="opp-quality-score" style="color: var(--warning);">0.0</div>
                         </div>
                     </div>
-                    <div class="metric-card" style="padding: 1rem;">
-                        <div class="metric-label">Trade Quality Score</div>
-                        <div class="metric-value" id="opp-quality-score" style="color: var(--warning);">0.0</div>
+                    <div class="metrics-grid">
+                        <div class="metric-card" style="padding: 1rem; background: rgba(255,255,255,0.01);">
+                            <div class="metric-label">Opportunity Confidence</div>
+                            <div class="metric-value" id="opp-confidence">0.0%</div>
+                        </div>
+                        <div class="metric-card" style="padding: 1rem; background: rgba(255,255,255,0.01);">
+                            <div class="metric-label">ML Win Probability</div>
+                            <div class="metric-value" id="opp-probability">0.0%</div>
+                        </div>
+                        <div class="metric-card" style="padding: 1rem; background: rgba(255,255,255,0.01);">
+                            <div class="metric-label">ML Confidence Proxy</div>
+                            <div class="metric-value" id="opp-ml-confidence">0.0%</div>
+                        </div>
                     </div>
                 </div>
-                <div class="metrics-grid">
-                    <div class="metric-card" style="padding: 1rem; background: rgba(255,255,255,0.01);">
-                        <div class="metric-label">Opportunity Confidence</div>
-                        <div class="metric-value" id="opp-confidence">0.0%</div>
+
+                <div class="card">
+                    <div class="card-title">Portfolio & Account Balance (Dual Brokers)</div>
+                    
+                    <h3 style="font-size: 0.85rem; color: var(--success); margin-bottom: 0.75rem; letter-spacing: 0.05em;">📈 LIVE FYERS ACCOUNT</h3>
+                    <div class="metrics-grid" style="margin-bottom: 1.5rem;">
+                        <div class="metric-card" style="padding: 1rem;">
+                            <div class="metric-label">Total Capital Limit</div>
+                            <div class="metric-value highlight" id="live-val-limit">₹0.00</div>
+                        </div>
+                        <div class="metric-card" style="padding: 1rem;">
+                            <div class="metric-label">Utilized Margin</div>
+                            <div class="metric-value" id="live-val-utilized">₹0.00</div>
+                        </div>
+                        <div class="metric-card" style="padding: 1rem;">
+                            <div class="metric-label">Available Balance</div>
+                            <div class="metric-value" id="live-val-available">₹0.00</div>
+                        </div>
                     </div>
-                    <div class="metric-card" style="padding: 1rem; background: rgba(255,255,255,0.01);">
-                        <div class="metric-label">ML Win Probability</div>
-                        <div class="metric-value" id="opp-probability">0.0%</div>
+
+                    <h3 style="font-size: 0.85rem; color: var(--primary); margin-bottom: 0.75rem; letter-spacing: 0.05em;">🤖 PAPER / DELTA TRADING ACCOUNT</h3>
+                    <div class="metrics-grid">
+                        <div class="metric-card" style="padding: 1rem;">
+                            <div class="metric-label">Total Capital Limit</div>
+                            <div class="metric-value highlight" id="paper-val-limit">₹0.00</div>
+                        </div>
+                        <div class="metric-card" style="padding: 1rem;">
+                            <div class="metric-label">Utilized Margin</div>
+                            <div class="metric-value" id="paper-val-utilized">₹0.00</div>
+                        </div>
+                        <div class="metric-card" style="padding: 1rem;">
+                            <div class="metric-label">Available Balance</div>
+                            <div class="metric-value" id="paper-val-available">₹0.00</div>
+                        </div>
                     </div>
-                    <div class="metric-card" style="padding: 1rem; background: rgba(255,255,255,0.01);">
-                        <div class="metric-label">ML Confidence Proxy</div>
-                        <div class="metric-value" id="opp-ml-confidence">0.0%</div>
-                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">Active Net Positions</div>
+                    <table id="positions-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Side</th>
+                                <th>Qty</th>
+                                <th>Avg Price</th>
+                                <th>LTP</th>
+                                <th>PnL</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td colspan="6" style="text-align: center; color: var(--text-muted);">No active positions found</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">Recent Order Log</div>
+                    <table id="orders-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Symbol</th>
+                                <th>Side</th>
+                                <th>Qty</th>
+                                <th>Avg Price</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td colspan="6" style="text-align: center; color: var(--text-muted);">No recent orders found</td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
 
-            <div class="card">
-                <div class="card-title">Portfolio & Account Balance (Dual Engines)</div>
-                
-                <h3 style="font-size: 0.85rem; color: var(--success); margin-bottom: 0.75rem; letter-spacing: 0.05em;">📈 LIVE FYERS ACCOUNT</h3>
-                <div class="metrics-grid" style="margin-bottom: 1.5rem;">
-                    <div class="metric-card" style="padding: 1rem;">
-                        <div class="metric-label">Total Capital Limit</div>
-                        <div class="metric-value highlight" id="live-val-limit">₹0.00</div>
+            <div>
+                <div class="card">
+                    <div class="card-title">Fyers API Activation</div>
+                    <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.5rem; line-height: 1.4;">
+                        Use this panel to exchange authorization code for a persistent Fyers session token.
+                    </p>
+                    <div class="form-group" style="text-align: center; margin-bottom: 1.5rem;">
+                        <a href="#" target="_blank" class="btn" id="fyers-login-btn">1. Authorize App on Fyers</a>
                     </div>
-                    <div class="metric-card" style="padding: 1rem;">
-                        <div class="metric-label">Utilized Margin</div>
-                        <div class="metric-value" id="live-val-utilized">₹0.00</div>
+                    <div class="form-group">
+                        <label for="auth-code-input">2. Paste Auth Code</label>
+                        <input type="text" id="auth-code-input" class="input-text" placeholder="e.g. eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...">
                     </div>
-                    <div class="metric-card" style="padding: 1rem;">
-                        <div class="metric-label">Available Balance</div>
-                        <div class="metric-value" id="live-val-available">₹0.00</div>
-                    </div>
-                </div>
-
-                <h3 style="font-size: 0.85rem; color: var(--primary); margin-bottom: 0.75rem; letter-spacing: 0.05em;">🤖 PAPER TRADING ACCOUNT</h3>
-                <div class="metrics-grid">
-                    <div class="metric-card" style="padding: 1rem;">
-                        <div class="metric-label">Total Capital Limit</div>
-                        <div class="metric-value highlight" id="paper-val-limit">₹0.00</div>
-                    </div>
-                    <div class="metric-card" style="padding: 1rem;">
-                        <div class="metric-label">Utilized Margin</div>
-                        <div class="metric-value" id="paper-val-utilized">₹0.00</div>
-                    </div>
-                    <div class="metric-card" style="padding: 1rem;">
-                        <div class="metric-label">Available Balance</div>
-                        <div class="metric-value" id="paper-val-available">₹0.00</div>
-                    </div>
+                    <button class="btn btn-secondary" style="width: 100%;" id="activate-token-btn">3. Generate & Save Token</button>
+                    <div id="activation-message" style="margin-top: 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;"></div>
                 </div>
             </div>
+        </div>
+    </div>
 
-            <div class="card">
-                <div class="card-title">Active Net Positions</div>
-                <table id="positions-table">
+    <!-- TAB 2: Enterprise Journals -->
+    <div id="tab-journals" class="tab-content">
+        <div class="card">
+            <div class="card-title">
+                <span>Enterprise Audit Journals (TimescaleDB Hypertables)</span>
+                <div style="display: flex; gap: 0.5rem;">
+                    <button class="btn btn-secondary" onclick="loadJournalTab('trade')" style="padding: 0.4rem 0.8rem; font-size: 0.8rem;">Trade Journal</button>
+                    <button class="btn btn-secondary" onclick="loadJournalTab('decision')" style="padding: 0.4rem 0.8rem; font-size: 0.8rem;">Decision Journal</button>
+                    <button class="btn btn-secondary" onclick="loadJournalTab('risk')" style="padding: 0.4rem 0.8rem; font-size: 0.8rem;">Risk Audit</button>
+                    <button class="btn btn-secondary" onclick="loadJournalTab('ml')" style="padding: 0.4rem 0.8rem; font-size: 0.8rem;">ML Predictions</button>
+                </div>
+            </div>
+            <div style="overflow-x: auto;">
+                <table id="journal-data-table">
                     <thead>
-                        <tr>
+                        <tr id="journal-table-head">
+                            <th>Timestamp</th>
                             <th>Symbol</th>
-                            <th>Side</th>
-                            <th>Buy Qty</th>
-                            <th>Avg Price</th>
-                            <th>LTP</th>
-                            <th>PnL</th>
+                            <th>Event / Details</th>
                         </tr>
                     </thead>
                     <tbody>
                         <tr>
-                            <td colspan="6" style="text-align: center; color: var(--text-muted);">No active positions found</td>
-                        </tr>
-                    </tbody>
-                </table>
-            </div>
-
-            <div class="card">
-                <div class="card-title">Recent Order Log</div>
-                <table id="orders-table">
-                    <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>Symbol</th>
-                            <th>Side</th>
-                            <th>Qty</th>
-                            <th>Avg Price</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td colspan="6" style="text-align: center; color: var(--text-muted);">No recent orders found</td>
+                            <td colspan="3" style="text-align: center; color: var(--text-muted);">Select a journal to view logs</td>
                         </tr>
                     </tbody>
                 </table>
             </div>
         </div>
+    </div>
 
-        <!-- Sidebar / Auth Console -->
-        <div>
-            <div class="card">
-                <div class="card-title">Historical Data Downloader</div>
-                <div id="downloader-alert-box" style="display: none; padding: 0.75rem; border-radius: 6px; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); margin-bottom: 0.75rem; font-size: 0.8rem; color: #fca5a5; line-height: 1.4;"></div>
-                <div class="form-group" style="margin-bottom: 0.75rem;">
-                    <label for="download-year-select">Select Year</label>
-                    <select id="download-year-select" class="input-text" style="background-color: #121824; border: 1px solid var(--border-color); color: var(--text-main); width: 100%; padding: 0.5rem; border-radius: 4px;">
-                        <option value="2026">2026</option>
-                    </select>
-                </div>
-                <div class="form-group" style="margin-bottom: 0.75rem;">
-                    <label for="download-symbol-select">Select Symbol</label>
-                    <select id="download-symbol-select" class="input-text" style="background-color: #121824; border: 1px solid var(--border-color); color: var(--text-main); width: 100%; padding: 0.5rem; border-radius: 4px;">
-                        <option value="NSE:NIFTY50-INDEX">NSE:NIFTY50-INDEX</option>
-                        <option value="NSE:INDIAVIX-INDEX">NSE:INDIAVIX-INDEX</option>
-                    </select>
-                </div>
-                <div id="downloader-info-box" style="margin: 1rem 0; padding: 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color);">
-                    <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between; margin-bottom: 0.25rem;">
-                        <span>Status:</span>
-                        <strong id="downloader-status-val" style="color: var(--warning);">Checking...</strong>
-                    </div>
-                    <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between;">
-                        <span>Progress:</span>
-                        <strong id="downloader-progress-val">0 / 0 days</strong>
-                    </div>
-                    <div id="downloader-time-row" style="font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between; margin-top: 0.25rem;">
-                        <span>Est. Time Left:</span>
-                        <strong id="downloader-time-val" style="color: #6366f1;">--:--</strong>
-                    </div>
-                </div>
-                <button id="downloader-action-btn" class="btn" style="width: 100%;">Start Data Collection</button>
+    <!-- TAB 3: Research & Performance Analytics -->
+    <div id="tab-research" class="tab-content">
+        <div class="card">
+            <div class="card-title">
+                <span>Research & Performance Analytics Lab</span>
+                <select id="research-symbol-select" onchange="loadResearchData()" class="input-text" style="width: auto; padding: 0.4rem 1rem; font-size: 0.85rem;">
+                    <option value="BTCUSD_PERP">BTCUSD_PERP</option>
+                    <option value="ETHUSD_PERP">ETHUSD_PERP</option>
+                    <option value="SOLUSD_PERP">SOLUSD_PERP</option>
+                    <option value="NSE:NIFTY50-INDEX">NSE:NIFTY50-INDEX</option>
+                </select>
             </div>
-
-            <!-- Ingestion Pipeline Monitor Card -->
-            <div class="card">
-                <div class="card-title">Ingestion Pipeline Monitor</div>
-                
-                <h3 style="font-size: 0.8rem; color: var(--primary); margin-bottom: 0.5rem; letter-spacing: 0.05em;">🔄 ACTIVE & PAST JOBS</h3>
-                <div style="max-height: 160px; overflow-y: auto; margin-bottom: 1.5rem; border: 1px solid var(--border-color); border-radius: 8px; background: rgba(0,0,0,0.15);">
-                    <table style="margin-top: 0;" id="pipeline-jobs-table">
-                        <thead>
-                            <tr style="position: sticky; top: 0; background: #101524; z-index: 1;">
-                                <th style="padding: 0.5rem; font-size: 0.75rem;">Symbol</th>
-                                <th style="padding: 0.5rem; font-size: 0.75rem;">Year</th>
-                                <th style="padding: 0.5rem; font-size: 0.75rem;">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr>
-                                <td colspan="3" style="text-align: center; color: var(--text-muted); padding: 0.75rem; font-size: 0.8rem;">No active pipeline jobs</td>
-                            </tr>
-                        </tbody>
-                    </table>
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <div class="metric-label">Sharpe Ratio</div>
+                    <div class="metric-value highlight" id="perf-sharpe">0.00</div>
                 </div>
-
-                <h3 style="font-size: 0.8rem; color: var(--success); margin-bottom: 0.5rem; letter-spacing: 0.05em;">📊 LATEST INGESTED CANDLES (10)</h3>
-                <div style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; background: rgba(0,0,0,0.15);">
-                    <table style="margin-top: 0;" id="candles-preview-table">
-                        <thead>
-                            <tr style="position: sticky; top: 0; background: #101524; z-index: 1;">
-                                <th style="padding: 0.4rem; font-size: 0.75rem;">Time</th>
-                                <th style="padding: 0.4rem; font-size: 0.75rem;">O</th>
-                                <th style="padding: 0.4rem; font-size: 0.75rem;">H</th>
-                                <th style="padding: 0.4rem; font-size: 0.75rem;">L</th>
-                                <th style="padding: 0.4rem; font-size: 0.75rem;">C</th>
-                                <th style="padding: 0.4rem; font-size: 0.75rem;">V</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr>
-                                <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 0.75rem; font-size: 0.8rem;">Select symbol to preview</td>
-                            </tr>
-                        </tbody>
-                    </table>
+                <div class="metric-card">
+                    <div class="metric-label">Win Rate %</div>
+                    <div class="metric-value" id="perf-winrate" style="color: var(--success);">0.0%</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Profit Factor</div>
+                    <div class="metric-value" id="perf-profitfactor">0.00</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Max Drawdown</div>
+                    <div class="metric-value" id="perf-maxdrawdown" style="color: var(--danger);">0.0%</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Trade Expectancy</div>
+                    <div class="metric-value" id="perf-expectancy">₹0.00</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Total Trades</div>
+                    <div class="metric-value" id="perf-totaltrades">0</div>
                 </div>
             </div>
+        </div>
+    </div>
 
-            <div class="card">
-                <div class="card-title">Fyers API Activation</div>
-                <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.5rem; line-height: 1.4;">
-                    Your bridge is currently running in live-only mode. Use this console to complete user authorization and exchange your authentication code for a persistent session token.
-                </p>
-                
-                <div class="form-group" style="text-align: center; margin-bottom: 1.5rem;">
-                    <a href="#" target="_blank" class="btn" id="fyers-login-btn">1. Authorize App on Fyers</a>
+    <!-- TAB 4: Symbol Mappings & Crypto Futures -->
+    <div id="tab-symbols" class="tab-content">
+        <div class="card">
+            <div class="card-title">Unified Symbol Registry & Delta Crypto Futures</div>
+            <table id="symbol-mappings-table">
+                <thead>
+                    <tr>
+                        <th>Canonical Symbol</th>
+                        <th>Broker Name</th>
+                        <th>Broker Symbol</th>
+                        <th>Exchange</th>
+                        <th>Asset Class</th>
+                        <th>Tick Size</th>
+                        <th>Max Leverage</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td colspan="7" style="text-align: center; color: var(--text-muted);">Loading symbol mappings...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- TAB 5: Historical Data Downloader -->
+    <div id="tab-downloader" class="tab-content">
+        <div class="grid-container">
+            <div>
+                <div class="card">
+                    <div class="card-title">Historical Data Downloader</div>
+                    <div id="downloader-alert-box" style="display: none; padding: 0.75rem; border-radius: 6px; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); margin-bottom: 0.75rem; font-size: 0.8rem; color: #fca5a5; line-height: 1.4;"></div>
+                    <div class="form-group" style="margin-bottom: 0.75rem;">
+                        <label for="download-year-select">Select Year</label>
+                        <select id="download-year-select" class="input-text" style="background-color: #121824; border: 1px solid var(--border-color); color: var(--text-main); width: 100%; padding: 0.5rem; border-radius: 4px;">
+                            <option value="2026">2026</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="margin-bottom: 0.75rem;">
+                        <label for="download-symbol-select">Select Symbol</label>
+                        <select id="download-symbol-select" class="input-text" style="background-color: #121824; border: 1px solid var(--border-color); color: var(--text-main); width: 100%; padding: 0.5rem; border-radius: 4px;">
+                            <option value="BTCUSD_PERP">BTCUSD_PERP (Delta Exchange 24/7)</option>
+                            <option value="ETHUSD_PERP">ETHUSD_PERP (Delta Exchange 24/7)</option>
+                            <option value="SOLUSD_PERP">SOLUSD_PERP (Delta Exchange 24/7)</option>
+                            <option value="NSE:NIFTY50-INDEX">NSE:NIFTY50-INDEX (Fyers)</option>
+                            <option value="NSE:INDIAVIX-INDEX">NSE:INDIAVIX-INDEX (Fyers)</option>
+                        </select>
+                    </div>
+                    <div id="downloader-info-box" style="margin: 1rem 0; padding: 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color);">
+                        <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between; margin-bottom: 0.25rem;">
+                            <span>Status:</span>
+                            <strong id="downloader-status-val" style="color: var(--warning);">Checking...</strong>
+                        </div>
+                        <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between;">
+                            <span>Progress:</span>
+                            <strong id="downloader-progress-val">0 / 0 days</strong>
+                        </div>
+                        <div id="downloader-time-row" style="font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between; margin-top: 0.25rem;">
+                            <span>Est. Time Left:</span>
+                            <strong id="downloader-time-val" style="color: #6366f1;">--:--</strong>
+                        </div>
+                    </div>
+                    <button id="downloader-action-btn" class="btn" style="width: 100%;">Start Data Collection</button>
                 </div>
+            </div>
 
-                <div class="form-group">
-                    <label for="auth-code-input">2. Paste Auth Code from Redirect Link</label>
-                    <input type="text" id="auth-code-input" class="input-text" placeholder="e.g. eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...">
+            <div>
+                <div class="card">
+                    <div class="card-title">Ingestion Pipeline Monitor</div>
+                    <h3 style="font-size: 0.8rem; color: var(--primary); margin-bottom: 0.5rem; letter-spacing: 0.05em;">🔄 ACTIVE & PAST JOBS</h3>
+                    <div style="max-height: 160px; overflow-y: auto; margin-bottom: 1.5rem; border: 1px solid var(--border-color); border-radius: 8px; background: rgba(0,0,0,0.15);">
+                        <table style="margin-top: 0;" id="pipeline-jobs-table">
+                            <thead>
+                                <tr style="position: sticky; top: 0; background: #101524; z-index: 1;">
+                                    <th style="padding: 0.5rem; font-size: 0.75rem;">Symbol</th>
+                                    <th style="padding: 0.5rem; font-size: 0.75rem;">Year</th>
+                                    <th style="padding: 0.5rem; font-size: 0.75rem;">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td colspan="3" style="text-align: center; color: var(--text-muted); padding: 0.75rem; font-size: 0.8rem;">No active pipeline jobs</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
-
-                <button class="btn btn-secondary" style="width: 100%;" id="activate-token-btn">3. Generate & Save Token</button>
-                <div id="activation-message" style="margin-top: 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;"></div>
             </div>
         </div>
     </div>
 
     <script>
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.nav-tab').forEach(b => b.classList.remove('active'));
+            
+            const target = document.getElementById(tabId);
+            if (target) target.classList.add('active');
+            
+            event.target.classList.add('active');
+
+            if (tabId === 'tab-journals') loadJournalTab('trade');
+            if (tabId === 'tab-research') loadResearchData();
+            if (tabId === 'tab-symbols') loadSymbolMappings();
+        }
+
+        async function loadJournalTab(type) {
+            const head = document.getElementById('journal-table-head');
+            const tbody = document.querySelector('#journal-data-table tbody');
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--text-muted);">Loading journal logs...</td></tr>';
+            
+            try {
+                const res = await fetch(`/journals/${type}`);
+                const data = await res.json();
+                
+                if (type === 'trade') {
+                    head.innerHTML = `<th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry P</th><th>Exit P</th><th>PnL</th><th>Broker</th><th>Leverage</th>`;
+                    if (data.trades && data.trades.length > 0) {
+                        tbody.innerHTML = data.trades.map(t => `
+                            <tr>
+                                <td>${new Date(t.timestamp).toLocaleTimeString()}</td>
+                                <td><strong>${t.symbol}</strong></td>
+                                <td>${t.side.toUpperCase()}</td>
+                                <td>${t.qty}</td>
+                                <td>₹${t.entry_price.toFixed(2)}</td>
+                                <td>₹${t.exit_price.toFixed(2)}</td>
+                                <td class="${t.pnl >= 0 ? 'pnl-green' : 'pnl-red'}">₹${t.pnl.toFixed(2)}</td>
+                                <td>${t.broker}</td>
+                                <td>${t.leverage}x</td>
+                            </tr>
+                        `).join('');
+                    } else {
+                        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; color: var(--text-muted);">No trade journal entries recorded yet</td></tr>';
+                    }
+                } else if (type === 'decision') {
+                    head.innerHTML = `<th>Time</th><th>Symbol</th><th>Decision</th><th>Score</th><th>Threshold</th><th>Regime</th><th>ML Confidence</th>`;
+                    if (data.decisions && data.decisions.length > 0) {
+                        tbody.innerHTML = data.decisions.map(d => `
+                            <tr>
+                                <td>${new Date(d.timestamp).toLocaleTimeString()}</td>
+                                <td><strong>${d.symbol}</strong></td>
+                                <td><span class="status-badge ${d.decision === 'Trade' ? 'badge-trade' : 'badge-wait'}">${d.decision}</span></td>
+                                <td>${d.score.toFixed(1)}</td>
+                                <td>${d.threshold.toFixed(1)}</td>
+                                <td>${d.regime}</td>
+                                <td>${d.ml_confidence.toFixed(1)}%</td>
+                            </tr>
+                        `).join('');
+                    } else {
+                        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color: var(--text-muted);">No decision journal entries recorded yet</td></tr>';
+                    }
+                } else if (type === 'risk') {
+                    head.innerHTML = `<th>Time</th><th>Symbol</th><th>Event</th><th>Lev Used</th><th>Lev Limit</th><th>Passed</th>`;
+                    if (data.risk_logs && data.risk_logs.length > 0) {
+                        tbody.innerHTML = data.risk_logs.map(r => `
+                            <tr>
+                                <td>${new Date(r.timestamp).toLocaleTimeString()}</td>
+                                <td><strong>${r.symbol}</strong></td>
+                                <td>${r.event}</td>
+                                <td>${r.leverage_used.toFixed(1)}x</td>
+                                <td>${r.leverage_limit.toFixed(1)}x</td>
+                                <td style="color: ${r.check_passed ? 'var(--success)' : 'var(--danger)'}">${r.check_passed ? 'PASSED' : 'REJECTED'}</td>
+                            </tr>
+                        `).join('');
+                    } else {
+                        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color: var(--text-muted);">No risk journal entries recorded yet</td></tr>';
+                    }
+                } else if (type === 'ml') {
+                    head.innerHTML = `<th>Time</th><th>Symbol</th><th>Price</th><th>Prediction Score</th><th>Passed</th>`;
+                    if (data.ml_predictions && data.ml_predictions.length > 0) {
+                        tbody.innerHTML = data.ml_predictions.map(m => `
+                            <tr>
+                                <td>${new Date(m.timestamp).toLocaleTimeString()}</td>
+                                <td><strong>${m.symbol}</strong></td>
+                                <td>₹${m.price.toFixed(2)}</td>
+                                <td style="font-weight: 700; color: var(--primary);">${m.prediction_score.toFixed(1)}%</td>
+                                <td style="color: ${m.passed ? 'var(--success)' : 'var(--danger)'}">${m.passed ? 'PASS' : 'FAIL'}</td>
+                            </tr>
+                        `).join('');
+                    } else {
+                        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--text-muted);">No ML journal entries recorded yet</td></tr>';
+                    }
+                }
+            } catch (e) {
+                console.error("Failed to load journal", e);
+            }
+        }
+
+        async function loadResearchData() {
+            const sym = document.getElementById('research-symbol-select').value;
+            try {
+                const res = await fetch(`/research/performance?symbol=${encodeURIComponent(sym)}`);
+                const data = await res.json();
+                if (data.status === 'success' && data.performance) {
+                    const p = data.performance;
+                    document.getElementById('perf-sharpe').textContent = p.sharpe_ratio.toFixed(2);
+                    document.getElementById('perf-winrate').textContent = `${p.win_rate.toFixed(1)}%`;
+                    document.getElementById('perf-profitfactor').textContent = p.profit_factor === Infinity ? '∞' : p.profit_factor.toFixed(2);
+                    document.getElementById('perf-maxdrawdown').textContent = `${p.max_drawdown_pct.toFixed(1)}%`;
+                    document.getElementById('perf-expectancy').textContent = `₹${p.expectancy.toFixed(2)}`;
+                    document.getElementById('perf-totaltrades').textContent = p.total_trades;
+                }
+            } catch (e) {
+                console.error("Failed to load research data", e);
+            }
+        }
+
+        async function loadSymbolMappings() {
+            const tbody = document.querySelector('#symbol-mappings-table tbody');
+            try {
+                const res = await fetch('/database/symbol-mappings');
+                const data = await res.json();
+                if (data.status === 'success' && data.mappings) {
+                    tbody.innerHTML = data.mappings.map(m => `
+                        <tr>
+                            <td><strong>${m.canonical_symbol}</strong></td>
+                            <td><span style="color: ${m.broker_name === 'DELTA' ? 'var(--primary)' : 'var(--success)';} font-weight:600;">${m.broker_name}</span></td>
+                            <td><code>${m.broker_symbol}</code></td>
+                            <td>${m.exchange}</td>
+                            <td>${m.asset_class}</td>
+                            <td>${m.tick_size}</td>
+                            <td><strong style="color: var(--warning);">${m.max_leverage}x</strong></td>
+                        </tr>
+                    `).join('');
+                }
+            } catch (e) {
+                console.error("Failed to load symbol mappings", e);
+            }
+        }
+
         // Fetch Auth URL on load
         async function fetchAuthUrl() {
             try {
@@ -1070,8 +1347,11 @@ async fn health_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serd
 }
 
 async fn portfolio_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serde_json::Value> {
-    let live_funds = state.broker.live.funds().await.ok();
-    let paper_funds = state.broker.paper.funds().await.ok();
+    let (live_funds, paper_funds) = if let Some(hybrid) = state.broker.as_any().downcast_ref::<price_broker::HybridBroker>() {
+        (hybrid.live.funds().await.ok(), hybrid.paper.funds().await.ok())
+    } else {
+        (state.broker.funds().await.ok(), None)
+    };
     let positions = state.broker.positions().await.unwrap_or_default();
     let holdings = state.broker.holdings().await.unwrap_or_default();
     
@@ -1117,6 +1397,9 @@ async fn place_order_handler(
         side,
         limit_price: payload.limit_price,
         stop_price: 0.0,
+        leverage: None,
+        reduce_only: None,
+        post_only: None,
     };
     
     match state.broker.place_order(req).await {
@@ -1536,13 +1819,20 @@ async fn start_background_downloader(db: TimescaleClient, python_broker_url: Str
                     let symbol: String = row.get("symbol");
                     let from_date: chrono::NaiveDate = row.get("from_date");
                     let to_date: chrono::NaiveDate = row.get("to_date");
-                    info!("Background downloader executing job for {} from {} to {}", symbol, from_date, to_date);
+                    // Resolve exchange from symbol mapping if available
+                    let exchange = if let Ok(Some(m)) = db.get_symbol_mapping(&symbol).await {
+                        m.exchange
+                    } else {
+                        "NSE".to_string()
+                    };
+
+                    info!("Background downloader executing job for {} (exchange {}) from {} to {}", symbol, exchange, from_date, to_date);
                     
                     // Mark as IN_PROGRESS
                     let _ = db.mark_job_status(&symbol, from_date, to_date, "IN_PROGRESS").await;
 
                     // Download history
-                    match downloader.download_history(&symbol, "NSE", from_date, to_date).await {
+                    match downloader.download_history(&symbol, &exchange, from_date, to_date).await {
                         Ok(_) => {
                             info!("Successfully finished background download job for {} from {} to {}", symbol, from_date, to_date);
                             let _ = db.mark_job_status(&symbol, from_date, to_date, "COMPLETED").await;
@@ -1568,6 +1858,23 @@ async fn start_background_downloader(db: TimescaleClient, python_broker_url: Str
         }
     });
 }
+
+async fn symbol_mappings_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    match state.db.get_symbol_mappings().await {
+        Ok(mappings) => Json(serde_json::json!({
+            "status": "success",
+            "count": mappings.len(),
+            "mappings": mappings
+        })),
+        Err(e) => Json(serde_json::json!({
+            "status": "error",
+            "message": e.to_string()
+        })),
+    }
+}
+
 
 async fn get_live_status_handler(
     Extension(state): Extension<Arc<AppState>>,
@@ -1691,5 +1998,219 @@ async fn candles_preview_handler(
         }
     }
 }
+
+async fn journals_trade_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let rows = sqlx::query(
+        "SELECT id, timestamp, session_id, symbol, side, entry_price, exit_price, qty, pnl, slippage, fill_latency_ms, exit_reason, broker, leverage
+         FROM trade_journal ORDER BY timestamp DESC LIMIT 50"
+    )
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match rows {
+        Ok(items) => {
+            let mut list = Vec::new();
+            for r in items {
+                let id: String = r.get("id");
+                let ts: chrono::DateTime<chrono::Utc> = r.get("timestamp");
+                let sym: String = r.get("symbol");
+                let side: String = r.get("side");
+                let entry_p: f64 = r.get::<Option<f64>, _>("entry_price").unwrap_or(0.0);
+                let exit_p: f64 = r.get::<Option<f64>, _>("exit_price").unwrap_or(0.0);
+                let qty: i32 = r.get::<Option<i32>, _>("qty").unwrap_or(0);
+                let pnl: f64 = r.get::<Option<f64>, _>("pnl").unwrap_or(0.0);
+                let slip: f64 = r.get::<Option<f64>, _>("slippage").unwrap_or(0.0);
+                let lat: i64 = r.get::<Option<i64>, _>("fill_latency_ms").unwrap_or(0);
+                let reason: String = r.get::<Option<String>, _>("exit_reason").unwrap_or_default();
+                let broker: String = r.get::<Option<String>, _>("broker").unwrap_or_default();
+                let lev: i32 = r.get::<Option<i32>, _>("leverage").unwrap_or(1);
+
+                list.push(serde_json::json!({
+                    "id": id,
+                    "timestamp": ts.to_rfc3339(),
+                    "symbol": sym,
+                    "side": side,
+                    "entry_price": entry_p,
+                    "exit_price": exit_p,
+                    "qty": qty,
+                    "pnl": pnl,
+                    "slippage": slip,
+                    "fill_latency_ms": lat,
+                    "exit_reason": reason,
+                    "broker": broker,
+                    "leverage": lev
+                }));
+            }
+            Json(serde_json::json!({ "status": "success", "count": list.len(), "trades": list }))
+        }
+        Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() }))
+    }
+}
+
+async fn journals_decision_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let rows = sqlx::query(
+        "SELECT id, timestamp, symbol, signal_score, threshold, decision, rejection_reason, regime, ml_confidence, vix, atr
+         FROM decision_journal ORDER BY timestamp DESC LIMIT 50"
+    )
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match rows {
+        Ok(items) => {
+            let mut list = Vec::new();
+            for r in items {
+                let id: String = r.get("id");
+                let ts: chrono::DateTime<chrono::Utc> = r.get("timestamp");
+                let sym: String = r.get("symbol");
+                let score: f64 = r.get::<Option<f64>, _>("signal_score").unwrap_or(0.0);
+                let thresh: f64 = r.get::<Option<f64>, _>("threshold").unwrap_or(0.0);
+                let dec: String = r.get::<Option<String>, _>("decision").unwrap_or_default();
+                let rej: Option<String> = r.get("rejection_reason");
+                let regime: String = r.get::<Option<String>, _>("regime").unwrap_or_default();
+                let ml: f64 = r.get::<Option<f64>, _>("ml_confidence").unwrap_or(0.0);
+                let vix: f64 = r.get::<Option<f64>, _>("vix").unwrap_or(0.0);
+
+                list.push(serde_json::json!({
+                    "id": id,
+                    "timestamp": ts.to_rfc3339(),
+                    "symbol": sym,
+                    "score": score,
+                    "threshold": thresh,
+                    "decision": dec,
+                    "rejection_reason": rej,
+                    "regime": regime,
+                    "ml_confidence": ml,
+                    "vix": vix
+                }));
+            }
+            Json(serde_json::json!({ "status": "success", "count": list.len(), "decisions": list }))
+        }
+        Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() }))
+    }
+}
+
+async fn journals_risk_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let rows = sqlx::query(
+        "SELECT id, timestamp, symbol, event, leverage_used, leverage_limit, concentration, margin_utilization, check_passed, rejection_reason
+         FROM risk_journal ORDER BY timestamp DESC LIMIT 50"
+    )
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match rows {
+        Ok(items) => {
+            let mut list = Vec::new();
+            for r in items {
+                let id: String = r.get("id");
+                let ts: chrono::DateTime<chrono::Utc> = r.get("timestamp");
+                let sym: String = r.get("symbol");
+                let event: String = r.get::<Option<String>, _>("event").unwrap_or_default();
+                let lev_used: f64 = r.get::<Option<f64>, _>("leverage_used").unwrap_or(0.0);
+                let lev_lim: f64 = r.get::<Option<f64>, _>("leverage_limit").unwrap_or(0.0);
+                let conc: f64 = r.get::<Option<f64>, _>("concentration").unwrap_or(0.0);
+                let passed: bool = r.get::<Option<bool>, _>("check_passed").unwrap_or(true);
+                let rej: Option<String> = r.get("rejection_reason");
+
+                list.push(serde_json::json!({
+                    "id": id,
+                    "timestamp": ts.to_rfc3339(),
+                    "symbol": sym,
+                    "event": event,
+                    "leverage_used": lev_used,
+                    "leverage_limit": lev_lim,
+                    "concentration": conc,
+                    "check_passed": passed,
+                    "rejection_reason": rej
+                }));
+            }
+            Json(serde_json::json!({ "status": "success", "count": list.len(), "risk_logs": list }))
+        }
+        Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() }))
+    }
+}
+
+async fn journals_ml_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let rows = sqlx::query(
+        "SELECT id, timestamp, symbol, price, vwap, vix, slope, prediction_score, threshold, passed
+         FROM ml_journal ORDER BY timestamp DESC LIMIT 50"
+    )
+    .fetch_all(&state.db.pool)
+    .await;
+
+    match rows {
+        Ok(items) => {
+            let mut list = Vec::new();
+            for r in items {
+                let id: String = r.get("id");
+                let ts: chrono::DateTime<chrono::Utc> = r.get("timestamp");
+                let sym: String = r.get("symbol");
+                let p: f64 = r.get::<Option<f64>, _>("price").unwrap_or(0.0);
+                let score: f64 = r.get::<Option<f64>, _>("prediction_score").unwrap_or(0.0);
+                let passed: bool = r.get::<Option<bool>, _>("passed").unwrap_or(false);
+
+                list.push(serde_json::json!({
+                    "id": id,
+                    "timestamp": ts.to_rfc3339(),
+                    "symbol": sym,
+                    "price": p,
+                    "prediction_score": score,
+                    "passed": passed
+                }));
+            }
+            Json(serde_json::json!({ "status": "success", "count": list.len(), "ml_predictions": list }))
+        }
+        Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() }))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ResearchParams {
+    symbol: Option<String>,
+}
+
+async fn research_performance_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<ResearchParams>,
+) -> Json<serde_json::Value> {
+    let sym = params.symbol.unwrap_or_else(|| "BTCUSD_PERP".to_string());
+    
+    // Fetch closed trades for this symbol
+    let rows = sqlx::query(
+        "SELECT symbol, pnl, entry_price, exit_price, qty FROM trade_journal WHERE symbol = $1 ORDER BY timestamp ASC"
+    )
+    .bind(&sym)
+    .fetch_all(&state.db.pool)
+    .await;
+
+    let trades = match rows {
+        Ok(items) => {
+            items.into_iter().map(|r| price_research::ClosedTrade {
+                symbol: r.get("symbol"),
+                pnl: r.get::<Option<f64>, _>("pnl").unwrap_or(0.0),
+                entry_price: r.get::<Option<f64>, _>("entry_price").unwrap_or(0.0),
+                exit_price: r.get::<Option<f64>, _>("exit_price").unwrap_or(0.0),
+                qty: r.get::<Option<i32>, _>("qty").unwrap_or(0),
+            }).collect()
+        }
+        Err(_) => Vec::new()
+    };
+
+    let report = price_research::PerformanceAnalyzer::analyze(&sym, &trades);
+
+    Json(serde_json::json!({
+        "status": "success",
+        "symbol": sym,
+        "performance": report
+    }))
+}
+
 
 

@@ -288,4 +288,12 @@ impl Broker for FyersClient {
             Err(PriceError::BrokerError("Failed to fetch history".to_string()))
         }
     }
+
+    fn broker_type(&self) -> BrokerType {
+        BrokerType::Fyers
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

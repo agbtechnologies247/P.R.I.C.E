@@ -17,4 +17,8 @@ pub trait Broker: Send + Sync {
     async fn trades(&self) -> Result<Vec<Trade>>;
     async fn quotes(&self, symbols: Vec<String>) -> Result<Vec<Quote>>;
     async fn history(&self, request: HistoryRequest) -> Result<CandleSeries>;
+    
+    fn supports_leverage(&self) -> bool { false }
+    fn broker_type(&self) -> BrokerType;
+    fn as_any(&self) -> &dyn std::any::Any;
 }

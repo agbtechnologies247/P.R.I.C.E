@@ -78,4 +78,5 @@ pub enum EngineEvent {
     MLUpdated {
         samples_count: usize,
     },
+    RiskRejected(String),
 }

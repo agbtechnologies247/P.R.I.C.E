@@ -115,5 +115,77 @@ pub async fn init_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // 4. Create execution_context_logs table for Market Memory (Gap 10)
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS execution_context_logs (
+            timestamp TIMESTAMPTZ NOT NULL,
+            trade_id TEXT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            price DOUBLE PRECISION NOT NULL,
+            qty INT NOT NULL,
+            regime TEXT NOT NULL,
+            ml_confidence DOUBLE PRECISION NOT NULL,
+            portfolio_delta DOUBLE PRECISION NOT NULL,
+            portfolio_gamma DOUBLE PRECISION NOT NULL,
+            portfolio_exposure DOUBLE PRECISION NOT NULL,
+            leverage_usage DOUBLE PRECISION NOT NULL,
+            margin_utilization DOUBLE PRECISION NOT NULL,
+            vix DOUBLE PRECISION NOT NULL,
+            atr DOUBLE PRECISION NOT NULL,
+            vwap DOUBLE PRECISION NOT NULL,
+            open_interest BIGINT,
+            volume BIGINT,
+            outcome_pnl DOUBLE PRECISION
+        );"
+    )
+    .execute(pool)
+    .await?;
+
+    // 5. Create symbol_mappings table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS symbol_mappings (
+            canonical_symbol TEXT PRIMARY KEY,
+            broker_name TEXT NOT NULL,
+            broker_symbol TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            asset_class TEXT NOT NULL,
+            tick_size DOUBLE PRECISION NOT NULL DEFAULT 0.05,
+            lot_size DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+            max_leverage INT NOT NULL DEFAULT 1
+        );"
+    )
+    .execute(pool)
+    .await?;
+
+    // Seed default symbol mappings if empty
+    let seed_data = vec![
+        ("BTCUSD_PERP", "DELTA", "BTCUSD", "DELTA", "CRYPTO_PERP", 0.5, 1.0, 200),
+        ("ETHUSD_PERP", "DELTA", "ETHUSD", "DELTA", "CRYPTO_PERP", 0.05, 1.0, 200),
+        ("SOLUSD_PERP", "DELTA", "SOLUSD", "DELTA", "CRYPTO_PERP", 0.01, 1.0, 100),
+        ("NSE:NIFTY50-INDEX", "FYERS", "NSE:NIFTY50-INDEX", "NSE", "INDEX", 0.05, 50.0, 1),
+        ("NSE:NIFTYBANK-INDEX", "FYERS", "NSE:NIFTYBANK-INDEX", "NSE", "INDEX", 0.05, 15.0, 1),
+        ("NSE:RELIANCE-EQ", "FYERS", "NSE:RELIANCE-EQ", "NSE", "EQUITY", 0.05, 1.0, 1),
+    ];
+
+    for (canon, b_name, b_sym, exch, asset, tick, lot, lev) in seed_data {
+        let _ = sqlx::query(
+            "INSERT INTO symbol_mappings (canonical_symbol, broker_name, broker_symbol, exchange, asset_class, tick_size, lot_size, max_leverage)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (canonical_symbol) DO NOTHING"
+        )
+        .bind(canon)
+        .bind(b_name)
+        .bind(b_sym)
+        .bind(exch)
+        .bind(asset)
+        .bind(tick)
+        .bind(lot)
+        .bind(lev)
+        .execute(pool)
+        .await;
+    }
+
     Ok(())
 }
+

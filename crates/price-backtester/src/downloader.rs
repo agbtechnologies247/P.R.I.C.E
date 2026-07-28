@@ -110,12 +110,114 @@ impl HistoricalDownloader {
         from_date: NaiveDate,
         to_date: NaiveDate,
     ) -> anyhow::Result<()> {
+        // Resolve symbol mapping if available
+        let (canonical_symbol, broker_symbol, exch) = if let Ok(Some(mapping)) = self.db.get_symbol_mapping(symbol).await {
+            (mapping.canonical_symbol, mapping.broker_symbol, mapping.exchange)
+        } else {
+            let ex = if exchange.is_empty() { "NSE" } else { exchange };
+            (symbol.to_string(), symbol.to_string(), ex.to_string())
+        };
+
+        if exch.to_uppercase() == "DELTA" {
+            self.fetch_delta_segment(&canonical_symbol, &broker_symbol, from_date, to_date).await
+        } else {
+            self.fetch_fyers_segment(&canonical_symbol, &broker_symbol, &exch, from_date, to_date).await
+        }
+    }
+
+    async fn fetch_delta_segment(
+        &self,
+        canonical_symbol: &str,
+        broker_symbol: &str,
+        from_date: NaiveDate,
+        to_date: NaiveDate,
+    ) -> anyhow::Result<()> {
+        let from_time = from_date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+        let to_time = to_date.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp();
+
+        let delta_url = std::env::var("DELTA_BASE_URL")
+            .unwrap_or_else(|_| "https://api.delta.exchange".to_string());
+        let url = format!("{}/v2/history/candles?symbol={}&resolution=1m&start={}&end={}",
+            delta_url, broker_symbol, from_time, to_time);
+
+        let res = self.client.get(&url).send().await?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let err_text = res.text().await.unwrap_or_default();
+            anyhow::bail!("Delta API status {}: {}", status, err_text);
+        }
+
+        let body: serde_json::Value = res.json().await?;
+        let mut parsed_candles = Vec::new();
+
+        if let Some(result_arr) = body.get("result").and_then(|r| r.as_array()) {
+            for item in result_arr {
+                let ts_epoch = if let Some(t) = item.get("time").and_then(|t| t.as_i64()) {
+                    t
+                } else if let Some(t_str) = item.get("time").and_then(|t| t.as_str()) {
+                    t_str.parse().unwrap_or(0)
+                } else {
+                    0
+                };
+
+                if ts_epoch == 0 { continue; }
+                let timestamp = chrono::DateTime::<Utc>::from_timestamp(ts_epoch, 0)
+                    .unwrap_or_else(|| Utc::now());
+
+                let parse_f64 = |val: &serde_json::Value| -> f64 {
+                    if let Some(f) = val.as_f64() {
+                        f
+                    } else if let Some(s) = val.as_str() {
+                        s.parse().unwrap_or(0.0)
+                    } else {
+                        0.0
+                    }
+                };
+
+                let open = parse_f64(&item["open"]);
+                let high = parse_f64(&item["high"]);
+                let low = parse_f64(&item["low"]);
+                let close = parse_f64(&item["close"]);
+                let volume = parse_f64(&item["volume"]).round() as u64;
+
+                parsed_candles.push(Candle {
+                    timestamp,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                });
+            }
+        }
+
+        if parsed_candles.is_empty() {
+            tracing::warn!("No Delta candles returned for {} ({} to {}).", canonical_symbol, from_date, to_date);
+            return Ok(());
+        }
+
+        // Sort ascending by timestamp
+        parsed_candles.sort_by_key(|c| c.timestamp);
+
+        self.db.insert_candles(canonical_symbol, "DELTA", "1m", &parsed_candles).await?;
+        tracing::info!("Saved {} Delta candles for {} in TimescaleDB.", parsed_candles.len(), canonical_symbol);
+        Ok(())
+    }
+
+    async fn fetch_fyers_segment(
+        &self,
+        canonical_symbol: &str,
+        broker_symbol: &str,
+        exchange: &str,
+        from_date: NaiveDate,
+        to_date: NaiveDate,
+    ) -> anyhow::Result<()> {
         let from_str = from_date.format("%Y-%m-%d").to_string();
         let to_str = to_date.format("%Y-%m-%d").to_string();
 
         let url = format!("{}/history", self.python_broker_url);
         let payload = serde_json::json!({
-            "symbol": symbol,
+            "symbol": broker_symbol,
             "resolution": "1", // 1 minute resolution
             "date_format": "0", // Epoch timestamps
             "range_from": from_str,
@@ -148,7 +250,7 @@ impl HistoricalDownloader {
                         let timestamp = chrono::DateTime::<Utc>::from_timestamp(ts_epoch, 0)
                             .unwrap_or_else(|| Utc::now());
 
-                        // Validate market session hours
+                        // Validate market session hours for NSE
                         if !price_core::is_indian_market_hours(timestamp) {
                             continue;
                         }
@@ -172,17 +274,16 @@ impl HistoricalDownloader {
             }
         }
 
-        // It is possible some segments have no trading days (e.g. holidays or weekends)
-        // If so, we don't treat it as a hard failure, we just log and complete.
         if parsed_candles.is_empty() {
-            tracing::warn!("No candles returned for segment {} to {}.", from_str, to_str);
+            tracing::warn!("No Fyers candles returned for segment {} to {}.", from_str, to_str);
             return Ok(());
         }
 
-        self.db.insert_candles(symbol, exchange, "1m", &parsed_candles).await?;
+        self.db.insert_candles(canonical_symbol, exchange, "1m", &parsed_candles).await?;
         Ok(())
     }
 }
+
 
 /// Partitions a date range into chunks of specified maximum length in days.
 fn partition_date_range(start: NaiveDate, end: NaiveDate, chunk_days: i64) -> Vec<(NaiveDate, NaiveDate)> {

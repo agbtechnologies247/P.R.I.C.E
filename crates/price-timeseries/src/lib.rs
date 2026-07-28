@@ -180,4 +180,119 @@ impl TimescaleClient {
             .await?;
         Ok(())
     }
+
+    pub async fn insert_context_log(
+        &self,
+        log: &ExecutionContextLog,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO execution_context_logs (
+                timestamp, trade_id, symbol, side, price, qty, regime, ml_confidence,
+                portfolio_delta, portfolio_gamma, portfolio_exposure, leverage_usage,
+                margin_utilization, vix, atr, vwap, open_interest, volume, outcome_pnl
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"
+        )
+        .bind(log.timestamp)
+        .bind(&log.trade_id)
+        .bind(&log.symbol)
+        .bind(&log.side)
+        .bind(log.price)
+        .bind(log.qty)
+        .bind(&log.regime)
+        .bind(log.ml_confidence)
+        .bind(log.portfolio_delta)
+        .bind(log.portfolio_gamma)
+        .bind(log.portfolio_exposure)
+        .bind(log.leverage_usage)
+        .bind(log.margin_utilization)
+        .bind(log.vix)
+        .bind(log.atr)
+        .bind(log.vwap)
+        .bind(log.open_interest)
+        .bind(log.volume)
+        .bind(log.outcome_pnl)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_symbol_mappings(&self) -> anyhow::Result<Vec<SymbolMapping>> {
+        let rows = sqlx::query(
+            "SELECT canonical_symbol, broker_name, broker_symbol, exchange, asset_class, tick_size, lot_size, max_leverage
+             FROM symbol_mappings"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mappings = rows.into_iter().map(|r| SymbolMapping {
+            canonical_symbol: r.get("canonical_symbol"),
+            broker_name: r.get("broker_name"),
+            broker_symbol: r.get("broker_symbol"),
+            exchange: r.get("exchange"),
+            asset_class: r.get("asset_class"),
+            tick_size: r.get("tick_size"),
+            lot_size: r.get("lot_size"),
+            max_leverage: r.get("max_leverage"),
+        }).collect();
+
+        Ok(mappings)
+    }
+
+    pub async fn get_symbol_mapping(&self, symbol: &str) -> anyhow::Result<Option<SymbolMapping>> {
+        let row = sqlx::query(
+            "SELECT canonical_symbol, broker_name, broker_symbol, exchange, asset_class, tick_size, lot_size, max_leverage
+             FROM symbol_mappings
+             WHERE canonical_symbol = $1 OR broker_symbol = $1"
+        )
+        .bind(symbol)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| SymbolMapping {
+            canonical_symbol: r.get("canonical_symbol"),
+            broker_name: r.get("broker_name"),
+            broker_symbol: r.get("broker_symbol"),
+            exchange: r.get("exchange"),
+            asset_class: r.get("asset_class"),
+            tick_size: r.get("tick_size"),
+            lot_size: r.get("lot_size"),
+            max_leverage: r.get("max_leverage"),
+        }))
+    }
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SymbolMapping {
+    pub canonical_symbol: String,
+    pub broker_name: String,
+    pub broker_symbol: String,
+    pub exchange: String,
+    pub asset_class: String,
+    pub tick_size: f64,
+    pub lot_size: f64,
+    pub max_leverage: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionContextLog {
+    pub timestamp: DateTime<Utc>,
+    pub trade_id: Option<String>,
+    pub symbol: String,
+    pub side: String,
+    pub price: f64,
+    pub qty: i32,
+    pub regime: String,
+    pub ml_confidence: f64,
+    pub portfolio_delta: f64,
+    pub portfolio_gamma: f64,
+    pub portfolio_exposure: f64,
+    pub leverage_usage: f64,
+    pub margin_utilization: f64,
+    pub vix: f64,
+    pub atr: f64,
+    pub vwap: f64,
+    pub open_interest: Option<i64>,
+    pub volume: Option<i64>,
+    pub outcome_pnl: Option<f64>,
+}
+

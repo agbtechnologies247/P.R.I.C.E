@@ -9,10 +9,13 @@ members = [
     "crates/price-execution",
     "crates/price-timeseries",
     "crates/price-backtester",
+    "crates/price-ml",
+    "crates/price-journal",
+    "crates/price-research",
     "apps/price-worker",
     "apps/price-server",
-    "apps/price-cli"
-, "crates/price-ml"]
+    "apps/price-cli",
+]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

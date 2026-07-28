@@ -8,6 +8,7 @@ pub mod support_resistance;
 pub mod fibonacci;
 pub mod smc;
 pub mod volume_profile;
+pub mod order_flow;
 
 pub use wma::calculate_wma;
 pub use vwap::VwapCalculator;
@@ -19,3 +20,4 @@ pub use support_resistance::{calculate_sr_zones, SrZone};
 pub use fibonacci::{calculate_fib_levels, calculate_confluence_score, FibLevels};
 pub use smc::{detect_smc_patterns, SmcSignals};
 pub use volume_profile::{calculate_volume_profile, VolumeProfile};
+pub use order_flow::OrderFlowTracker;

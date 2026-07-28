@@ -10,6 +10,7 @@ price-indicators = { path = "../../crates/price-indicators" }
 price-strategy = { path = "../../crates/price-strategy" }
 price-risk = { path = "../../crates/price-risk" }
 price-execution = { path = "../../crates/price-execution" }
+price-timeseries = { path = "../../crates/price-timeseries" }
 tokio.workspace = true
 serde.workspace = true
 chrono.workspace = true

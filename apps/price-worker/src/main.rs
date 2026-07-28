@@ -45,16 +45,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<i32>()?;
 
 
-    // 3. Setup Hybrid Broker (Simultaneous Live & Paper)
-    info!("Initializing HybridBroker (simultaneous Live + Paper trading)...");
-    let broker: Arc<dyn Broker> = Arc::new(price_broker::HybridBroker::new(&python_broker_url, 10000.0));
+    // 3. Setup Broker
+    let broker: Arc<dyn Broker> = if let Ok(delta_key) = std::env::var("DELTA_API_KEY") {
+        let delta_secret = std::env::var("DELTA_API_SECRET").unwrap_or_default();
+        let delta_url = std::env::var("DELTA_BASE_URL").unwrap_or_else(|_| "https://api.delta.exchange".to_string());
+        info!("Initializing DeltaExchangeClient with API Key: {}...", delta_key);
+        Arc::new(price_broker::DeltaExchangeClient::new(&delta_url, Some(delta_key), Some(delta_secret)))
+    } else {
+        info!("Initializing HybridBroker (simultaneous Live + Paper trading)...");
+        Arc::new(price_broker::HybridBroker::new(&python_broker_url, 10000.0))
+    };
     // Test login
     match broker.login().await {
         Ok(token) => info!("Successfully authenticated hybrid live client. Token length: {}", token.len()),
         Err(e) => warn!("Hybrid live client login failed: {:?}. Proceeding with mock/simulated fallbacks.", e),
     }
 
-    // 4. Initialize Engines
+    // 4. Initialize Engines & TimescaleClient
+    let database_url = std::env::var("DATABASE_URL").ok();
+    let timescale_client = if let Some(ref db_url) = database_url {
+        match price_timeseries::TimescaleClient::new(db_url).await {
+            Ok(client) => {
+                let _ = client.init_db().await;
+                info!("TimescaleDB client successfully connected for trade memory logging.");
+                Some(client)
+            }
+            Err(e) => {
+                warn!("Failed to initialize TimescaleDB client: {:?}. Proceeding without persistent market memory.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let risk_engine = RiskEngine::new(max_trades, daily_loss_limit);
     let opportunity_engine = OpportunityEngine::new(85.0, 75.0); // Thresholds
     let exit_evaluator = ExitEvaluator::new(1.5, 0.8, 15); // Target ATR mult, SL ATR mult, max hold 15 mins
@@ -64,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         risk_engine,
         opportunity_engine,
         exit_evaluator,
+        timescale_client,
     );
 
     // Test broker details on startup

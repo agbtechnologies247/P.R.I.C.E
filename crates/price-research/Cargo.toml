@@ -1,0 +1,16 @@
+[package]
+name = "price-research"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+price-core = { path = "../../crates/price-core" }
+price-indicators = { path = "../../crates/price-indicators" }
+price-strategy = { path = "../../crates/price-strategy" }
+price-ml = { path = "../../crates/price-ml" }

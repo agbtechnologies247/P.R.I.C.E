@@ -182,4 +182,12 @@ impl Broker for HybridBroker {
     async fn history(&self, request: HistoryRequest) -> Result<CandleSeries> {
         self.live.history(request).await
     }
+
+    fn broker_type(&self) -> BrokerType {
+        self.live.broker_type()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

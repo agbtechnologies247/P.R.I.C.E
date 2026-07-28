@@ -233,4 +233,12 @@ impl Broker for PaperBroker {
         }
         Ok(CandleSeries { candles })
     }
+
+    fn broker_type(&self) -> BrokerType {
+        BrokerType::Paper
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

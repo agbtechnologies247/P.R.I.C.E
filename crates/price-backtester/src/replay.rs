@@ -82,6 +82,7 @@ impl ReplayRunner {
             risk_engine,
             opportunity_engine,
             exit_evaluator,
+            None,
         );
 
         let mut equity_curve = Vec::new();

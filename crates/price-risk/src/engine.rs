@@ -36,7 +36,16 @@ impl RiskEngine {
         }
 
         // 3. Balance verification
-        let cost = request.qty as f64 * if request.r#type == 1 { request.limit_price } else { 500.0 };
+        let base_cost = request.qty as f64 * if request.r#type == 1 { request.limit_price } else { 500.0 };
+        let cost = if let Some(lev) = request.leverage {
+            if lev > 0 {
+                base_cost / lev as f64
+            } else {
+                base_cost
+            }
+        } else {
+            base_cost
+        };
         if cost > funds.available_balance {
             return Err(PriceError::InsufficientFunds {
                 available: funds.available_balance,

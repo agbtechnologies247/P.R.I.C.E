@@ -8,6 +8,7 @@ price-core = { path = "../../crates/price-core" }
 price-broker = { path = "../../crates/price-broker" }
 price-timeseries = { path = "../../crates/price-timeseries" }
 price-backtester = { path = "../../crates/price-backtester" }
+price-research = { path = "../../crates/price-research" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

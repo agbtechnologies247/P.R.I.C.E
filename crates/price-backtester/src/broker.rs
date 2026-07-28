@@ -281,4 +281,12 @@ impl Broker for ReplayBroker {
     async fn history(&self, _request: HistoryRequest) -> Result<CandleSeries> {
         Ok(CandleSeries { candles: Vec::new() })
     }
+
+    fn broker_type(&self) -> BrokerType {
+        BrokerType::Paper
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
