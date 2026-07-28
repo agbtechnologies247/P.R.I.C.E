@@ -1437,7 +1437,7 @@ async fn index_handler() -> Html<&'static str> {
 
                     const lastTime = new Date(ls.timestamp);
                     const diff = (new Date() - lastTime) / 1000;
-                    if (diff < 5) {
+                    if (isNaN(diff) || diff < 60) {
                         niftyPulse.style.backgroundColor = 'var(--success)';
                         niftyPulse.style.boxShadow = '0 0 10px var(--success)';
                         document.getElementById('last-update-time').textContent = 'LIVE CONNECTED';
@@ -1446,7 +1446,7 @@ async fn index_handler() -> Html<&'static str> {
                     } else {
                         niftyPulse.style.backgroundColor = 'var(--warning)';
                         niftyPulse.style.boxShadow = '0 0 10px var(--warning)';
-                        document.getElementById('last-update-time').textContent = `INACTIVE: ${Math.round(diff)}s AGO`;
+                        document.getElementById('last-update-time').textContent = `STANDBY: ${Math.round(diff)}s AGO`;
                         document.getElementById('last-update-time').style.color = 'var(--warning)';
                         document.getElementById('last-update-time').style.background = 'rgba(245, 158, 11, 0.1)';
                     }

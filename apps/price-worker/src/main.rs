@@ -293,44 +293,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
 
-                                        // Send status update to server once per second
-                                        if last_status_send.elapsed() >= Duration::from_millis(1000) {
-                                            last_status_send = std::time::Instant::now();
-                                            
-                                            let (prob, conf) = if let Some(ref opt) = orchestrator.last_opportunity {
-                                                (opt.probability, opt.confidence)
-                                            } else {
-                                                (0.0, 0.0)
-                                            };
-                                            
-                                            let decision = format!("{:?}", orchestrator.last_decision.unwrap_or(price_strategy::Decision::Wait));
-                                            let quality = orchestrator.last_quality.as_ref().map(|q| q.total).unwrap_or(0.0);
-                                            let target = orchestrator.last_target_option.clone().unwrap_or_else(|| "--".to_string());
+                                    }
 
-                                            let payload = serde_json::json!({
-                                                "nifty_price": orchestrator.current_nifty_spot,
-                                                "vix": orchestrator.current_vix,
-                                                "ml_confidence": orchestrator.current_ml_confidence,
-                                                "opportunity_confidence": conf,
-                                                "opportunity_probability": prob,
-                                                "decision": decision,
-                                                "quality_score": quality,
-                                                "target_option": target,
-                                                "btc_price": crypto_prices.get("BTC").copied().unwrap_or(0.0),
-                                                "eth_price": crypto_prices.get("ETH").copied().unwrap_or(0.0),
-                                                "sol_price": crypto_prices.get("SOL").copied().unwrap_or(0.0),
-                                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                                            });
+                                    // Send status update to server once per second on any incoming tick
+                                    if last_status_send.elapsed() >= Duration::from_millis(1000) {
+                                        last_status_send = std::time::Instant::now();
+                                        
+                                        let (prob, conf) = if let Some(ref opt) = orchestrator.last_opportunity {
+                                            (opt.probability, opt.confidence)
+                                        } else {
+                                            (0.0, 0.0)
+                                        };
+                                        
+                                        let decision = format!("{:?}", orchestrator.last_decision.unwrap_or(price_strategy::Decision::Wait));
+                                        let quality = orchestrator.last_quality.as_ref().map(|q| q.total).unwrap_or(0.0);
+                                        let target = orchestrator.last_target_option.clone().unwrap_or_else(|| "--".to_string());
 
-                                            let client_clone = http_client.clone();
-                                            let url_clone = format!("{}/live-status", server_url);
-                                            tokio::spawn(async move {
-                                                let _ = client_clone.post(&url_clone)
-                                                    .json(&payload)
-                                                    .send()
-                                                    .await;
-                                            });
-                                        }
+                                        let payload = serde_json::json!({
+                                            "nifty_price": orchestrator.current_nifty_spot,
+                                            "vix": orchestrator.current_vix,
+                                            "ml_confidence": orchestrator.current_ml_confidence,
+                                            "opportunity_confidence": conf,
+                                            "opportunity_probability": prob,
+                                            "decision": decision,
+                                            "quality_score": quality,
+                                            "target_option": target,
+                                            "btc_price": crypto_prices.get("BTC").copied().unwrap_or(0.0),
+                                            "eth_price": crypto_prices.get("ETH").copied().unwrap_or(0.0),
+                                            "sol_price": crypto_prices.get("SOL").copied().unwrap_or(0.0),
+                                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                                        });
+
+                                        let client_clone = http_client.clone();
+                                        let url_clone = format!("{}/live-status", server_url);
+                                        tokio::spawn(async move {
+                                            let _ = client_clone.post(&url_clone)
+                                                .json(&payload)
+                                                .send()
+                                                .await;
+                                        });
                                     }
 
                                     // Log status updates periodically
