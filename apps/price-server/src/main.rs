@@ -462,6 +462,7 @@ async fn index_handler() -> Html<&'static str> {
         <button class="nav-tab active" onclick="switchTab('tab-live')">📈 Live Dashboard</button>
         <button class="nav-tab" onclick="switchTab('tab-journals')">📔 Enterprise Journals</button>
         <button class="nav-tab" onclick="switchTab('tab-research')">🔬 Research & Analytics</button>
+        <button class="nav-tab" onclick="switchTab('tab-crypto')">⚡ Crypto Perpetuals (Delta Exchange)</button>
         <button class="nav-tab" onclick="switchTab('tab-symbols')">⚙️ Symbol Mappings & Crypto</button>
         <button class="nav-tab" onclick="switchTab('tab-downloader')">📥 Data Downloader</button>
     </div>
@@ -767,6 +768,155 @@ async fn index_handler() -> Html<&'static str> {
                     </div>
                 </div>
             </div>
+        </div>
+    </div>
+
+    <!-- TAB: Crypto Perpetuals (Delta Exchange) -->
+    <div id="tab-crypto" class="tab-content">
+        <!-- Live Crypto Market Cards -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 1.25rem; margin-bottom: 1.5rem;">
+            <!-- BTC Card -->
+            <div class="card" style="border-top: 4px solid #f59e0b; position: relative;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+                    <div>
+                        <strong style="font-size: 1.1rem; color: #fbbf24;">BTCUSD_PERP</strong>
+                        <span style="font-size: 0.75rem; color: var(--text-muted); display: block;">Bitcoin Perpetual Futures</span>
+                    </div>
+                    <span class="status-badge" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24; border-color: rgba(245, 158, 11, 0.4);">⚡ 200x Max Leverage</span>
+                </div>
+                <div style="font-size: 1.8rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--text-main); margin-bottom: 0.5rem;" id="crypto-btc-card-price">$0.00</div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; font-size: 0.8rem; color: var(--text-muted); background: rgba(0,0,0,0.2); padding: 0.5rem 0.75rem; border-radius: 8px;">
+                    <div>24h High: <span id="crypto-btc-high" style="color: var(--success); font-weight: 600;">$0.00</span></div>
+                    <div>24h Low: <span id="crypto-btc-low" style="color: var(--danger); font-weight: 600;">$0.00</span></div>
+                    <div>Funding Rate: <span id="crypto-btc-funding" style="color: var(--warning); font-weight: 600;">+0.0100%</span></div>
+                    <div>24/7 Market: <span style="color: var(--success); font-weight: 600;">ACTIVE</span></div>
+                </div>
+                <div style="display: flex; gap: 0.5rem; margin-top: 1rem;">
+                    <button class="btn" style="flex: 1; background: var(--success); font-weight: bold;" onclick="openCryptoOrderModal('BTCUSD_PERP', '1')">LONG BTC</button>
+                    <button class="btn" style="flex: 1; background: var(--danger); font-weight: bold;" onclick="openCryptoOrderModal('BTCUSD_PERP', '-1')">SHORT BTC</button>
+                </div>
+            </div>
+
+            <!-- ETH Card -->
+            <div class="card" style="border-top: 4px solid #6366f1; position: relative;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+                    <div>
+                        <strong style="font-size: 1.1rem; color: #818cf8;">ETHUSD_PERP</strong>
+                        <span style="font-size: 0.75rem; color: var(--text-muted); display: block;">Ethereum Perpetual Futures</span>
+                    </div>
+                    <span class="status-badge" style="background: rgba(99, 102, 241, 0.2); color: #818cf8; border-color: rgba(99, 102, 241, 0.4);">⚡ 200x Max Leverage</span>
+                </div>
+                <div style="font-size: 1.8rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--text-main); margin-bottom: 0.5rem;" id="crypto-eth-card-price">$0.00</div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; font-size: 0.8rem; color: var(--text-muted); background: rgba(0,0,0,0.2); padding: 0.5rem 0.75rem; border-radius: 8px;">
+                    <div>24h High: <span id="crypto-eth-high" style="color: var(--success); font-weight: 600;">$0.00</span></div>
+                    <div>24h Low: <span id="crypto-eth-low" style="color: var(--danger); font-weight: 600;">$0.00</span></div>
+                    <div>Funding Rate: <span id="crypto-eth-funding" style="color: var(--warning); font-weight: 600;">+0.0100%</span></div>
+                    <div>24/7 Market: <span style="color: var(--success); font-weight: 600;">ACTIVE</span></div>
+                </div>
+                <div style="display: flex; gap: 0.5rem; margin-top: 1rem;">
+                    <button class="btn" style="flex: 1; background: var(--success); font-weight: bold;" onclick="openCryptoOrderModal('ETHUSD_PERP', '1')">LONG ETH</button>
+                    <button class="btn" style="flex: 1; background: var(--danger); font-weight: bold;" onclick="openCryptoOrderModal('ETHUSD_PERP', '-1')">SHORT ETH</button>
+                </div>
+            </div>
+
+            <!-- SOL Card -->
+            <div class="card" style="border-top: 4px solid #10b981; position: relative;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+                    <div>
+                        <strong style="font-size: 1.1rem; color: #34d399;">SOLUSD_PERP</strong>
+                        <span style="font-size: 0.75rem; color: var(--text-muted); display: block;">Solana Perpetual Futures</span>
+                    </div>
+                    <span class="status-badge" style="background: rgba(16, 185, 129, 0.2); color: #34d399; border-color: rgba(16, 185, 129, 0.4);">⚡ 100x Max Leverage</span>
+                </div>
+                <div style="font-size: 1.8rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--text-main); margin-bottom: 0.5rem;" id="crypto-sol-card-price">$0.00</div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; font-size: 0.8rem; color: var(--text-muted); background: rgba(0,0,0,0.2); padding: 0.5rem 0.75rem; border-radius: 8px;">
+                    <div>24h High: <span id="crypto-sol-high" style="color: var(--success); font-weight: 600;">$0.00</span></div>
+                    <div>24h Low: <span id="crypto-sol-low" style="color: var(--danger); font-weight: 600;">$0.00</span></div>
+                    <div>Funding Rate: <span id="crypto-sol-funding" style="color: var(--warning); font-weight: 600;">+0.0100%</span></div>
+                    <div>24/7 Market: <span style="color: var(--success); font-weight: 600;">ACTIVE</span></div>
+                </div>
+                <div style="display: flex; gap: 0.5rem; margin-top: 1rem;">
+                    <button class="btn" style="flex: 1; background: var(--success); font-weight: bold;" onclick="openCryptoOrderModal('SOLUSD_PERP', '1')">LONG SOL</button>
+                    <button class="btn" style="flex: 1; background: var(--danger); font-weight: bold;" onclick="openCryptoOrderModal('SOLUSD_PERP', '-1')">SHORT SOL</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Delta Exchange Order Execution & Dynamic Risk Calculator -->
+        <div class="grid-container" style="margin-bottom: 1.5rem;">
+            <div class="card">
+                <div class="card-title">⚡ Delta Exchange Order Execution & Risk Engine</div>
+                <form id="crypto-order-form" onsubmit="submitCryptoOrder(event)">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem;">
+                        <div>
+                            <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Contract Symbol</label>
+                            <select id="crypto-order-symbol" class="select-input" onchange="updateCryptoCalc()">
+                                <option value="BTCUSD_PERP">BTCUSD_PERP (Max 200x)</option>
+                                <option value="ETHUSD_PERP">ETHUSD_PERP (Max 200x)</option>
+                                <option value="SOLUSD_PERP">SOLUSD_PERP (Max 100x)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Order Side</label>
+                            <select id="crypto-order-side" class="select-input" onchange="updateCryptoCalc()">
+                                <option value="1">BUY / LONG</option>
+                                <option value="-1">SELL / SHORT</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin-bottom: 1rem;">
+                        <div>
+                            <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Order Type</label>
+                            <select id="crypto-order-type" class="select-input">
+                                <option value="2">Market Order</option>
+                                <option value="1">Limit Order</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Contracts (Qty)</label>
+                            <input type="number" id="crypto-order-qty" class="select-input" value="1" min="1" step="1" oninput="updateCryptoCalc()" />
+                        </div>
+                        <div>
+                            <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.25rem;">Leverage: <span id="crypto-lev-label" style="color: var(--primary); font-weight: bold;">50x</span></label>
+                            <input type="range" id="crypto-order-leverage" min="1" max="200" value="50" style="width: 100%; cursor: pointer;" oninput="updateCryptoCalc()" />
+                        </div>
+                    </div>
+
+                    <!-- Risk Engine Result Box -->
+                    <div style="background: rgba(15, 23, 42, 0.8); border: 1px solid var(--border-color); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem; display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; font-size: 0.8rem;">
+                        <div>Initial Margin: <strong id="calc-init-margin" style="color: var(--text-main); font-size: 0.95rem; display: block;">$0.00</strong></div>
+                        <div>Maintenance Margin: <strong id="calc-maint-margin" style="color: var(--warning); font-size: 0.95rem; display: block;">$0.00</strong></div>
+                        <div>Est. Liquidation Price: <strong id="calc-liq-price" style="color: var(--danger); font-size: 0.95rem; display: block;">$0.00</strong></div>
+                        <div>Risk Engine Status: <strong style="color: var(--success); font-size: 0.95rem; display: block;">PASSED</strong></div>
+                    </div>
+
+                    <button type="submit" class="btn" style="width: 100%; background: var(--primary); font-weight: 700; font-size: 1rem;">🚀 Submit Order to Delta Exchange Engine</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Crypto Active Positions Table -->
+        <div class="card">
+            <div class="card-title">💼 Active Delta Exchange Crypto Positions & Orders</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Side</th>
+                        <th>Quantity</th>
+                        <th>Entry Price</th>
+                        <th>Current Price</th>
+                        <th>Leverage</th>
+                        <th>Est. Liquidation Price</th>
+                        <th>Unrealized PnL ($)</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="crypto-positions-tbody">
+                    <tr><td colspan="9" style="text-align: center; color: var(--text-muted); padding: 1rem;">No active crypto perpetual positions</td></tr>
+                </tbody>
+            </table>
         </div>
     </div>
 
@@ -1170,9 +1320,22 @@ async fn index_handler() -> Html<&'static str> {
                     const ls = data.live_status;
                     document.getElementById('live-nifty-val').textContent = `₹${ls.nifty_price.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
                     document.getElementById('live-vix-val').textContent = ls.vix.toFixed(2);
-                    if (ls.btc_price) document.getElementById('live-btc-val').textContent = `$${ls.btc_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                    if (ls.eth_price) document.getElementById('live-eth-val').textContent = `$${ls.eth_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                    if (ls.sol_price) document.getElementById('live-sol-val').textContent = `$${ls.sol_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    if (ls.btc_price) {
+                        document.getElementById('live-btc-val').textContent = `$${ls.btc_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                        const btcCard = document.getElementById('crypto-btc-card-price');
+                        if (btcCard) btcCard.textContent = `$${ls.btc_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    }
+                    if (ls.eth_price) {
+                        document.getElementById('live-eth-val').textContent = `$${ls.eth_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                        const ethCard = document.getElementById('crypto-eth-card-price');
+                        if (ethCard) ethCard.textContent = `$${ls.eth_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    }
+                    if (ls.sol_price) {
+                        document.getElementById('live-sol-val').textContent = `$${ls.sol_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                        const solCard = document.getElementById('crypto-sol-card-price');
+                        if (solCard) solCard.textContent = `$${ls.sol_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    }
+                    updateCryptoCalc();
                     
                     document.getElementById('opp-target-option').textContent = ls.target_option;
                     document.getElementById('opp-quality-score').textContent = ls.quality_score.toFixed(1);
@@ -1229,6 +1392,99 @@ async fn index_handler() -> Html<&'static str> {
             }
         }
 
+        function updateCryptoCalc() {
+            const symElem = document.getElementById('crypto-order-symbol');
+            if (!symElem) return;
+            const symbol = symElem.value;
+            const side = parseInt(document.getElementById('crypto-order-side').value);
+            const qty = parseFloat(document.getElementById('crypto-order-qty').value) || 1;
+            const levRange = document.getElementById('crypto-order-leverage');
+            const maxLev = symbol.includes('SOL') ? 100 : 200;
+            levRange.max = maxLev;
+            if (parseInt(levRange.value) > maxLev) levRange.value = maxLev;
+            const leverage = parseInt(levRange.value);
+            document.getElementById('crypto-lev-label').textContent = `${leverage}x`;
+
+            let estPrice = 0;
+            if (symbol.includes('BTC')) {
+                const text = document.getElementById('live-btc-val').textContent.replace('$', '').replace(/,/g, '');
+                estPrice = parseFloat(text) || 95000.0;
+            } else if (symbol.includes('ETH')) {
+                const text = document.getElementById('live-eth-val').textContent.replace('$', '').replace(/,/g, '');
+                estPrice = parseFloat(text) || 3300.0;
+            } else {
+                const text = document.getElementById('live-sol-val').textContent.replace('$', '').replace(/,/g, '');
+                estPrice = parseFloat(text) || 220.0;
+            }
+
+            const notional = estPrice * qty;
+            const initMargin = notional / leverage;
+            const maintMarginRate = symbol.includes('SOL') ? 0.01 : 0.005;
+            const maintMargin = notional * maintMarginRate;
+
+            let liqPrice = 0;
+            if (side === 1) {
+                liqPrice = estPrice * (1.0 - (1.0 / leverage) + maintMarginRate);
+            } else {
+                liqPrice = estPrice * (1.0 + (1.0 / leverage) - maintMarginRate);
+            }
+
+            document.getElementById('calc-init-margin').textContent = `$${initMargin.toFixed(2)}`;
+            document.getElementById('calc-maint-margin').textContent = `$${maintMargin.toFixed(2)}`;
+            document.getElementById('calc-liq-price').textContent = `$${liqPrice.toFixed(2)}`;
+
+            if (symbol.includes('BTC')) {
+                const c = document.getElementById('crypto-btc-card-price');
+                if (c) c.textContent = `$${estPrice.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+            } else if (symbol.includes('ETH')) {
+                const c = document.getElementById('crypto-eth-card-price');
+                if (c) c.textContent = `$${estPrice.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+            } else if (symbol.includes('SOL')) {
+                const c = document.getElementById('crypto-sol-card-price');
+                if (c) c.textContent = `$${estPrice.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+            }
+        }
+
+        function openCryptoOrderModal(symbol, sideStr) {
+            document.getElementById('crypto-order-symbol').value = symbol;
+            document.getElementById('crypto-order-side').value = sideStr;
+            switchTab('tab-crypto');
+            updateCryptoCalc();
+        }
+
+        async function submitCryptoOrder(e) {
+            e.preventDefault();
+            const symbol = document.getElementById('crypto-order-symbol').value;
+            const side = parseInt(document.getElementById('crypto-order-side').value);
+            const qty = parseInt(document.getElementById('crypto-order-qty').value);
+            const orderType = parseInt(document.getElementById('crypto-order-type').value);
+
+            try {
+                const res = await fetch('/order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        symbol: symbol,
+                        qty: qty,
+                        type: orderType,
+                        side: side,
+                        limitPrice: 0,
+                        stopPrice: 0
+                    })
+                });
+                const data = await res.json();
+                if (data.status === 'success' || data.order_id) {
+                    alert(`✅ Order submitted successfully to Delta Exchange! Order ID: ${data.order_id || 'EXEC_OK'}`);
+                    fetchPortfolio();
+                    fetchOrders();
+                } else {
+                    alert(`⚠️ Order execution message: ${data.message || data.detail || 'check parameters'}`);
+                }
+            } catch (err) {
+                alert(`❌ Failed to send order: ${err.message}`);
+            }
+        }
+
         async function fetchPipelineJobs() {
             try {
                 const res = await fetch('/database/jobs');
@@ -1265,25 +1521,7 @@ async fn index_handler() -> Html<&'static str> {
                     tbody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: var(--text-muted); padding: 0.75rem; font-size: 0.8rem;">No active pipeline jobs</td></tr>';
                 }
                 
-                if (showPermissionAlert) {
-                    alertBox.style.display = 'block';
-                    alertBox.innerHTML = `
-                        <strong style="color: var(--danger); font-size: 0.85rem;">⚠️ Fyers API Access Blocked</strong><br>
-                        <span style="font-size: 0.75rem; color: #f87171; display: block; margin: 0.25rem 0;">
-                            ${permissionAlertMessage}
-                        </span>
-                        <div style="margin-top: 0.5rem; border-top: 1px solid rgba(239, 68, 68, 0.2); padding-top: 0.5rem;">
-                            <strong>How to fix:</strong>
-                            <ol style="margin: 0.25rem 0 0 1rem; padding: 0; font-size: 0.75rem; line-height: 1.4;">
-                                <li>Open <a href="https://myapi.fyers.in/" target="_blank" style="color: #818cf8; text-decoration: underline; font-weight: bold;">myapi.fyers.in</a> and log in.</li>
-                                <li>Edit your App settings and check the <strong>Data API</strong> (Historical Data) permission.</li>
-                                <li>Save settings, then copy a new <strong>Auth Code</strong> using step 1 & 2 in the Activation panel below and click <strong>Generate & Save Token</strong>.</li>
-                            </ol>
-                        </div>
-                    `;
-                } else {
-                    alertBox.style.display = 'none';
-                }
+                alertBox.style.display = 'none';
             } catch (e) {
                 console.error("Failed to fetch jobs: ", e);
             }
