@@ -26,6 +26,12 @@ struct LiveStatusInfo {
     quality_score: f64,
     target_option: String,
     timestamp: String,
+    #[serde(default)]
+    btc_price: f64,
+    #[serde(default)]
+    eth_price: f64,
+    #[serde(default)]
+    sol_price: f64,
 }
 
 struct AppState {
@@ -417,16 +423,31 @@ async fn index_handler() -> Html<&'static str> {
         </div>
 
         <!-- Live Ticker Header -->
-        <div style="display: flex; gap: 2rem; align-items: center; background: rgba(20, 26, 46, 0.8); border: 1px solid var(--border-color); padding: 0.6rem 1.5rem; border-radius: 12px; backdrop-filter: blur(8px); box-shadow: 0 4px 20px rgba(0,0,0,0.2);">
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
+        <div style="display: flex; gap: 1.5rem; align-items: center; background: rgba(20, 26, 46, 0.8); border: 1px solid var(--border-color); padding: 0.6rem 1.5rem; border-radius: 12px; backdrop-filter: blur(8px); box-shadow: 0 4px 20px rgba(0,0,0,0.2); flex-wrap: wrap;">
+            <div style="display: flex; align-items: center; gap: 0.4rem;">
                 <span class="live-pulse" id="nifty-pulse-dot" style="background-color: var(--danger); box-shadow: 0 0 10px var(--danger);"></span>
-                <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600; letter-spacing: 0.05em;">NIFTY / CRYPTO:</span>
-                <span style="font-size: 1.15rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--text-main);" id="live-nifty-val">₹0.00</span>
+                <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600; letter-spacing: 0.05em;">NIFTY:</span>
+                <span style="font-size: 1rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--text-main);" id="live-nifty-val">₹0.00</span>
             </div>
-            <div style="width: 1px; height: 20px; background: var(--border-color);"></div>
-            <div style="display: flex; align-items: center; gap: 0.5rem;">
-                <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600; letter-spacing: 0.05em;">INDIA VIX:</span>
-                <span style="font-size: 1.15rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--warning);" id="live-vix-val">0.00</span>
+            <div style="width: 1px; height: 16px; background: var(--border-color);"></div>
+            <div style="display: flex; align-items: center; gap: 0.4rem;">
+                <span style="font-size: 0.75rem; color: #f59e0b; font-weight: 700; letter-spacing: 0.05em;">BTC (200x):</span>
+                <span style="font-size: 1rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: #fbbf24;" id="live-btc-val">$0.00</span>
+            </div>
+            <div style="width: 1px; height: 16px; background: var(--border-color);"></div>
+            <div style="display: flex; align-items: center; gap: 0.4rem;">
+                <span style="font-size: 0.75rem; color: #6366f1; font-weight: 700; letter-spacing: 0.05em;">ETH (200x):</span>
+                <span style="font-size: 1rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: #818cf8;" id="live-eth-val">$0.00</span>
+            </div>
+            <div style="width: 1px; height: 16px; background: var(--border-color);"></div>
+            <div style="display: flex; align-items: center; gap: 0.4rem;">
+                <span style="font-size: 0.75rem; color: #10b981; font-weight: 700; letter-spacing: 0.05em;">SOL (100x):</span>
+                <span style="font-size: 1rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: #34d399;" id="live-sol-val">$0.00</span>
+            </div>
+            <div style="width: 1px; height: 16px; background: var(--border-color);"></div>
+            <div style="display: flex; align-items: center; gap: 0.4rem;">
+                <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600; letter-spacing: 0.05em;">VIX:</span>
+                <span style="font-size: 1rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--warning);" id="live-vix-val">0.00</span>
             </div>
         </div>
 
@@ -1149,6 +1170,9 @@ async fn index_handler() -> Html<&'static str> {
                     const ls = data.live_status;
                     document.getElementById('live-nifty-val').textContent = `₹${ls.nifty_price.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
                     document.getElementById('live-vix-val').textContent = ls.vix.toFixed(2);
+                    if (ls.btc_price) document.getElementById('live-btc-val').textContent = `$${ls.btc_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    if (ls.eth_price) document.getElementById('live-eth-val').textContent = `$${ls.eth_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    if (ls.sol_price) document.getElementById('live-sol-val').textContent = `$${ls.sol_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
                     
                     document.getElementById('opp-target-option').textContent = ls.target_option;
                     document.getElementById('opp-quality-score').textContent = ls.quality_score.toFixed(1);

@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         risk_engine,
         opportunity_engine,
         exit_evaluator,
-        timescale_client,
+        timescale_client.clone(),
     );
 
     // Test broker details on startup
@@ -164,6 +164,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut last_status_send = std::time::Instant::now();
                 let server_url = std::env::var("SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
 
+                let mut candle_aggregators: HashMap<String, price_indicators::CandleAggregator> = HashMap::new();
+                let mut crypto_prices: HashMap<String, f64> = HashMap::new();
+
                 while let Some(message) = read.next().await {
                     match message {
                         Ok(msg) => {
@@ -171,7 +174,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok(ws_tick) = serde_json::from_str::<WsTick>(&text) {
                                     step += 1;
                                     
-                                    // 1. Process Stock Constituent updates
+                                    // 1. Process Crypto Ticks & Price Memory
+                                    if ws_tick.symbol.contains("BTC") {
+                                        crypto_prices.insert("BTC".to_string(), ws_tick.price);
+                                    } else if ws_tick.symbol.contains("ETH") {
+                                        crypto_prices.insert("ETH".to_string(), ws_tick.price);
+                                    } else if ws_tick.symbol.contains("SOL") {
+                                        crypto_prices.insert("SOL".to_string(), ws_tick.price);
+                                    }
+
+                                    // 2. Real-Time Tick-by-Tick OHLC Candle Aggregation
+                                    let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
+                                        .unwrap_or_else(Utc::now);
+                                    let tick = TickData {
+                                        symbol: ws_tick.symbol.clone(),
+                                        price: ws_tick.price,
+                                        volume: ws_tick.volume,
+                                        oi: ws_tick.oi,
+                                        timestamp: tick_time,
+                                    };
+
+                                    let agg = candle_aggregators.entry(ws_tick.symbol.clone())
+                                        .or_insert_with(price_indicators::CandleAggregator::new);
+                                    if let Some(closed_candle) = agg.ingest_tick(&tick) {
+                                        info!("1m OHLC Candle Closed for {}: O={:.2} H={:.2} L={:.2} C={:.2} V={}",
+                                            ws_tick.symbol, closed_candle.open, closed_candle.high, closed_candle.low, closed_candle.close, closed_candle.volume);
+                                        if let Some(ref db) = timescale_client {
+                                            let db_clone = db.clone();
+                                            let sym_clone = ws_tick.symbol.clone();
+                                            let exchange = if sym_clone.contains("USD") { "DELTA" } else { "NSE" };
+                                            tokio::spawn(async move {
+                                                let _ = db_clone.insert_candles(&sym_clone, exchange, "1m", &[closed_candle]).await;
+                                            });
+                                        }
+                                    }
+
+                                    // 3. Process Stock Constituent updates
                                     if weights.contains_key(ws_tick.symbol.as_str()) {
                                         let prev_record = stock_prices.get(&ws_tick.symbol);
                                         let prev_close = match prev_record {
@@ -194,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             ws_tick.symbol, ws_tick.price, weighted_delta);
                                     }
 
-                                    // 2. Perform Dynamic Strike subscription adjustments
+                                    // 4. Perform Dynamic Strike subscription adjustments
                                     if ws_tick.symbol == "NSE:NIFTY50-INDEX" {
                                         let strike = (ws_tick.price / 50.0).round() * 50.0;
                                         if last_subscribed_strike != Some(strike) {
@@ -226,7 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
 
-                                    // 3. Filter and pipe active option contracts + index/VIX ticks to Orchestrator
+                                    // 5. Filter and pipe active option contracts + index/VIX ticks to Orchestrator
                                     let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
                                         .unwrap_or_else(Utc::now);
                                     let tick_date = tick_time.naive_utc().date();
@@ -244,16 +282,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     };
 
                                     if ws_tick.symbol == "NSE:NIFTY50-INDEX" || ws_tick.symbol == "NSE:INDIAVIX-INDEX" || is_active_option {
-                                        let tick_time = chrono::DateTime::from_timestamp(ws_tick.timestamp, 0)
-                                            .unwrap_or_else(Utc::now);
-                                        let tick = TickData {
-                                            symbol: ws_tick.symbol.clone(),
-                                            price: ws_tick.price,
-                                            volume: ws_tick.volume,
-                                            oi: ws_tick.oi,
-                                            timestamp: tick_time,
-                                        };
-                                        
                                         match orchestrator.ingest_tick(tick).await {
                                             Ok(events) => {
                                                 for event in events {
@@ -288,6 +316,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 "decision": decision,
                                                 "quality_score": quality,
                                                 "target_option": target,
+                                                "btc_price": crypto_prices.get("BTC").copied().unwrap_or(0.0),
+                                                "eth_price": crypto_prices.get("ETH").copied().unwrap_or(0.0),
+                                                "sol_price": crypto_prices.get("SOL").copied().unwrap_or(0.0),
                                                 "timestamp": chrono::Utc::now().to_rfc3339(),
                                             });
 
