@@ -213,14 +213,14 @@ impl HistoricalDownloader {
         from_date: NaiveDate,
         to_date: NaiveDate,
     ) -> anyhow::Result<()> {
-        let from_str = from_date.format("%Y-%m-%d").to_string();
-        let to_str = to_date.format("%Y-%m-%d").to_string();
+        let from_str = format!("{} 09:15:00", from_date.format("%Y-%m-%d"));
+        let to_str = format!("{} 15:30:00", to_date.format("%Y-%m-%d"));
 
         let url = format!("{}/history", self.python_broker_url);
         let payload = serde_json::json!({
             "symbol": broker_symbol,
             "resolution": "1", // 1 minute resolution
-            "date_format": "0", // Epoch timestamps
+            "date_format": "1", // YYYY-MM-DD HH:MM:SS string date format
             "range_from": from_str,
             "range_to": to_str,
         });
