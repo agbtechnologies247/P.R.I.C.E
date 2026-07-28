@@ -423,11 +423,16 @@ async fn index_handler() -> Html<&'static str> {
         </div>
 
         <!-- Live Ticker Header -->
-        <div style="display: flex; gap: 1.5rem; align-items: center; background: rgba(20, 26, 46, 0.8); border: 1px solid var(--border-color); padding: 0.6rem 1.5rem; border-radius: 12px; backdrop-filter: blur(8px); box-shadow: 0 4px 20px rgba(0,0,0,0.2); flex-wrap: wrap;">
+        <div style="display: flex; gap: 1.25rem; align-items: center; background: rgba(20, 26, 46, 0.8); border: 1px solid var(--border-color); padding: 0.6rem 1.25rem; border-radius: 12px; backdrop-filter: blur(8px); box-shadow: 0 4px 20px rgba(0,0,0,0.2); flex-wrap: wrap;">
             <div style="display: flex; align-items: center; gap: 0.4rem;">
                 <span class="live-pulse" id="nifty-pulse-dot" style="background-color: var(--danger); box-shadow: 0 0 10px var(--danger);"></span>
                 <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600; letter-spacing: 0.05em;">NIFTY:</span>
                 <span style="font-size: 1rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--text-main);" id="live-nifty-val">₹0.00</span>
+            </div>
+            <div style="width: 1px; height: 16px; background: var(--border-color);"></div>
+            <div style="display: flex; align-items: center; gap: 0.4rem;">
+                <span style="font-size: 0.75rem; color: var(--warning); font-weight: 600; letter-spacing: 0.05em;">INDIA VIX:</span>
+                <span style="font-size: 1rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--warning);" id="live-vix-val">0.00</span>
             </div>
             <div style="width: 1px; height: 16px; background: var(--border-color);"></div>
             <div style="display: flex; align-items: center; gap: 0.4rem;">
@@ -444,11 +449,6 @@ async fn index_handler() -> Html<&'static str> {
                 <span style="font-size: 0.75rem; color: #10b981; font-weight: 700; letter-spacing: 0.05em;">SOL (100x):</span>
                 <span style="font-size: 1rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: #34d399;" id="live-sol-val">$0.00</span>
             </div>
-            <div style="width: 1px; height: 16px; background: var(--border-color);"></div>
-            <div style="display: flex; align-items: center; gap: 0.4rem;">
-                <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600; letter-spacing: 0.05em;">VIX:</span>
-                <span style="font-size: 1rem; font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: var(--warning);" id="live-vix-val">0.00</span>
-            </div>
         </div>
 
         <div class="status-badge" id="platform-status-badge">
@@ -459,12 +459,12 @@ async fn index_handler() -> Html<&'static str> {
 
     <!-- Navigation Tabs -->
     <div class="nav-tabs">
-        <button class="nav-tab active" onclick="switchTab('tab-live')">📈 Live Dashboard</button>
-        <button class="nav-tab" onclick="switchTab('tab-journals')">📔 Enterprise Journals</button>
-        <button class="nav-tab" onclick="switchTab('tab-research')">🔬 Research & Analytics</button>
-        <button class="nav-tab" onclick="switchTab('tab-crypto')">⚡ Crypto Perpetuals (Delta Exchange)</button>
-        <button class="nav-tab" onclick="switchTab('tab-symbols')">⚙️ Symbol Mappings & Crypto</button>
-        <button class="nav-tab" onclick="switchTab('tab-downloader')">📥 Data Downloader</button>
+        <button class="nav-tab active" onclick="switchTab('tab-live', this)">📈 Live Dashboard</button>
+        <button class="nav-tab" onclick="switchTab('tab-journals', this)">📔 Enterprise Journals</button>
+        <button class="nav-tab" onclick="switchTab('tab-research', this)">🔬 Research & Analytics</button>
+        <button class="nav-tab" onclick="switchTab('tab-crypto', this)">⚡ Crypto Perpetuals (Delta Exchange)</button>
+        <button class="nav-tab" onclick="switchTab('tab-symbols', this)">⚙️ Symbol Mappings & Crypto</button>
+        <button class="nav-tab" onclick="switchTab('tab-downloader', this)">📥 Data Downloader</button>
     </div>
 
     <!-- TAB 1: Live Dashboard -->
@@ -921,18 +921,87 @@ async fn index_handler() -> Html<&'static str> {
     </div>
 
     <script>
-        function switchTab(tabId) {
+        function switchTab(tabId, btnElem) {
             document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.nav-tab').forEach(b => b.classList.remove('active'));
             
             const target = document.getElementById(tabId);
             if (target) target.classList.add('active');
             
-            event.target.classList.add('active');
+            if (btnElem) {
+                btnElem.classList.add('active');
+            } else if (window.event && window.event.target && window.event.target.classList.contains('nav-tab')) {
+                window.event.target.classList.add('active');
+            } else {
+                const navBtns = document.querySelectorAll('.nav-tab');
+                navBtns.forEach(btn => {
+                    if (btn.getAttribute('onclick') && btn.getAttribute('onclick').includes(tabId)) {
+                        btn.classList.add('active');
+                    }
+                });
+            }
 
             if (tabId === 'tab-journals') loadJournalTab('trade');
             if (tabId === 'tab-research') loadResearchData();
             if (tabId === 'tab-symbols') loadSymbolMappings();
+            if (tabId === 'tab-crypto') fetchCryptoLiveQuotes();
+        }
+
+        async function fetchCryptoLiveQuotes() {
+            try {
+                const res = await fetch('https://api.delta.exchange/v2/tickers');
+                const data = await res.json();
+                if (data.success && data.result) {
+                    data.result.forEach(t => {
+                        if (t.symbol === 'BTCUSD_PERP') {
+                            const p = parseFloat(t.mark_price) || 0;
+                            const h = parseFloat(t.high) || 0;
+                            const l = parseFloat(t.low) || 0;
+                            const fr = (parseFloat(t.funding_rate) * 100) || 0.01;
+                            document.getElementById('live-btc-val').textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const c = document.getElementById('crypto-btc-card-price');
+                            if (c) c.textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const hElem = document.getElementById('crypto-btc-high');
+                            if (hElem) hElem.textContent = `$${h.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const lElem = document.getElementById('crypto-btc-low');
+                            if (lElem) lElem.textContent = `$${l.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const fElem = document.getElementById('crypto-btc-funding');
+                            if (fElem) fElem.textContent = `${fr >= 0 ? '+' : ''}${fr.toFixed(4)}%`;
+                        } else if (t.symbol === 'ETHUSD_PERP') {
+                            const p = parseFloat(t.mark_price) || 0;
+                            const h = parseFloat(t.high) || 0;
+                            const l = parseFloat(t.low) || 0;
+                            const fr = (parseFloat(t.funding_rate) * 100) || 0.01;
+                            document.getElementById('live-eth-val').textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const c = document.getElementById('crypto-eth-card-price');
+                            if (c) c.textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const hElem = document.getElementById('crypto-eth-high');
+                            if (hElem) hElem.textContent = `$${h.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const lElem = document.getElementById('crypto-eth-low');
+                            if (lElem) lElem.textContent = `$${l.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const fElem = document.getElementById('crypto-eth-funding');
+                            if (fElem) fElem.textContent = `${fr >= 0 ? '+' : ''}${fr.toFixed(4)}%`;
+                        } else if (t.symbol === 'SOLUSD_PERP') {
+                            const p = parseFloat(t.mark_price) || 0;
+                            const h = parseFloat(t.high) || 0;
+                            const l = parseFloat(t.low) || 0;
+                            const fr = (parseFloat(t.funding_rate) * 100) || 0.01;
+                            document.getElementById('live-sol-val').textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const c = document.getElementById('crypto-sol-card-price');
+                            if (c) c.textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const hElem = document.getElementById('crypto-sol-high');
+                            if (hElem) hElem.textContent = `$${h.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const lElem = document.getElementById('crypto-sol-low');
+                            if (lElem) lElem.textContent = `$${l.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                            const fElem = document.getElementById('crypto-sol-funding');
+                            if (fElem) fElem.textContent = `${fr >= 0 ? '+' : ''}${fr.toFixed(4)}%`;
+                        }
+                    });
+                    updateCryptoCalc();
+                }
+            } catch (e) {
+                console.error("Error fetching crypto tickers: ", e);
+            }
         }
 
         async function loadJournalTab(type) {
@@ -1582,10 +1651,12 @@ async fn index_handler() -> Html<&'static str> {
         fetchOrders();
         checkDownloadStatus();
         fetchLiveStatus();
+        fetchCryptoLiveQuotes();
         fetchPipelineJobs();
         fetchCandlesPreview();
         
         setInterval(fetchLiveStatus, 1000);
+        setInterval(fetchCryptoLiveQuotes, 2000);
         setInterval(() => {
             fetchPortfolio();
             fetchOrders();
