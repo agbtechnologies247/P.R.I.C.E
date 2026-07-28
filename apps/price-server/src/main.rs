@@ -102,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/journals/ml", get(journals_ml_handler))
         .route("/research/performance", get(research_performance_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/favicon.ico", get(favicon_handler))
         .layer(Extension(state));
 
     // 4. Run server
@@ -1560,6 +1561,7 @@ async fn index_handler() -> Html<&'static str> {
                 const data = await res.json();
                 const tbody = document.querySelector('#pipeline-jobs-table tbody');
                 const alertBox = document.getElementById('downloader-alert-box');
+                if (!tbody) return;
                 
                 let showPermissionAlert = false;
                 let permissionAlertMessage = "";
@@ -1590,13 +1592,16 @@ async fn index_handler() -> Html<&'static str> {
                     tbody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: var(--text-muted); padding: 0.75rem; font-size: 0.8rem;">No active pipeline jobs</td></tr>';
                 }
                 
-                alertBox.style.display = 'none';
+                if (alertBox) alertBox.style.display = 'none';
             } catch (e) {
                 console.error("Failed to fetch jobs: ", e);
             }
         }
 
         async function fetchCandlesPreview() {
+            const symbolSelect = document.getElementById('download-symbol-select');
+            const yearSelect = document.getElementById('download-year-select');
+            if (!symbolSelect || !yearSelect) return;
             const symbol = symbolSelect.value;
             const year = yearSelect.value;
             if (!symbol || !year) return;
@@ -1604,6 +1609,7 @@ async fn index_handler() -> Html<&'static str> {
                 const res = await fetch(`/database/candles-preview?symbol=${encodeURIComponent(symbol)}&year=${year}`);
                 const data = await res.json();
                 const tbody = document.querySelector('#candles-preview-table tbody');
+                if (!tbody) return;
                 if (data.status === 'success' && data.candles && data.candles.length > 0) {
                     tbody.innerHTML = '';
                     data.candles.forEach(c => {
@@ -1667,6 +1673,10 @@ async fn index_handler() -> Html<&'static str> {
 </body>
 </html>
 "##)
+}
+
+async fn favicon_handler() -> impl IntoResponse {
+    axum::http::StatusCode::NO_CONTENT
 }
 
 async fn health_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serde_json::Value> {
