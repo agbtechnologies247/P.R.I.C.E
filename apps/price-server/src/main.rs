@@ -1114,7 +1114,7 @@ async fn index_handler() -> Html<&'static str> {
                     tbody.innerHTML = data.mappings.map(m => `
                         <tr>
                             <td><strong>${m.canonical_symbol}</strong></td>
-                            <td><span style="color: ${m.broker_name === 'DELTA' ? 'var(--primary)' : 'var(--success)';} font-weight:600;">${m.broker_name}</span></td>
+                            <td><span style="color: ${m.broker_name === 'DELTA' ? 'var(--primary)' : 'var(--success)'}; font-weight:600;">${m.broker_name}</span></td>
                             <td><code>${m.broker_symbol}</code></td>
                             <td>${m.exchange}</td>
                             <td>${m.asset_class}</td>
