@@ -114,7 +114,7 @@ def get_history(req: HistoryRequest):
         data = {
             "symbol": req.symbol,
             "resolution": req.resolution,
-            "date_format": "0",  # Always fetch with Epoch Timestamp to keep DB cache standard
+            "date_format": "1",  # "1" for YYYY-MM-DD string date format
             "range_from": req.range_from,
             "range_to": req.range_to,
             "cont_flag": "1"

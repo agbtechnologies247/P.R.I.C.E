@@ -25,11 +25,12 @@ impl HistoricalDownloader {
         from_date: NaiveDate,
         to_date: NaiveDate,
     ) -> anyhow::Result<()> {
-        let segments = partition_date_range(from_date, to_date, 7);
+        let chunk_size = if exchange.to_uppercase() == "DELTA" { 14 } else { 30 };
+        let segments = partition_date_range(from_date, to_date, chunk_size);
         let total_segments = segments.len();
         tracing::info!(
-            "Partitioned historical download request for {} into {} weekly segments.",
-            symbol, total_segments
+            "Partitioned historical download request for {} into {} segments (chunk size {} days).",
+            symbol, total_segments, chunk_size
         );
 
         let mut any_failed = false;
