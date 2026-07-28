@@ -124,74 +124,75 @@ def get_history(req: HistoryRequest):
     if fyers is None or fyers == "mock":
         raise HTTPException(status_code=400, detail="Fyers API client is uninitialized or unauthenticated. Please authenticate via dashboard first.")
 
-    # Format date strings for Fyers API (including time if specified)
-    fyers_from = from_dt.strftime("%Y-%m-%d %H:%M:%S") if " " in req.range_from.strip() else from_dt.strftime("%Y-%m-%d")
-    fyers_to = to_dt.strftime("%Y-%m-%d %H:%M:%S") if " " in req.range_to.strip() else to_dt.strftime("%Y-%m-%d")
+    # Format parameters for Fyers API
+    # Try date_format="1" (YYYY-MM-DD) first, fallback to date_format="0" (Epoch timestamps)
+    date_format_options = [
+        ("1", from_dt.strftime("%Y-%m-%d"), to_dt.strftime("%Y-%m-%d")),
+        ("0", str(int(from_dt.replace(hour=9, minute=15, second=0).timestamp())), str(int(to_dt.replace(hour=15, minute=30, second=0).timestamp())))
+    ]
 
-    data = {
-        "symbol": req.symbol,
-        "resolution": req.resolution,
-        "date_format": "1",  # "1" for string date format
-        "range_from": fyers_from,
-        "range_to": fyers_to,
-        "cont_flag": "1"
+    last_error_msg = "Unknown error from Fyers history API"
+    last_err_code = -1
+
+    for df_mode, r_from, r_to in date_format_options:
+        data = {
+            "symbol": req.symbol,
+            "resolution": req.resolution,
+            "date_format": df_mode,
+            "range_from": r_from,
+            "range_to": r_to,
+            "cont_flag": "1"
+        }
+
+        max_retries = 2
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"Querying Fyers history API (mode={df_mode}): {data} (Attempt {attempt}/{max_retries})")
+                res = fyers.history(data=data)
+                if res.get("s") == "ok":
+                    candles = res.get("candles", [])
+                    if len(candles) > 0:
+                        try:
+                            conn = sqlite3.connect(config.DB_PATH)
+                            cursor = conn.cursor()
+                            for c in candles:
+                                cursor.execute(
+                                    "INSERT OR REPLACE INTO historical_candles (symbol, timestamp, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                    (req.symbol, int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), int(c[5]))
+                                )
+                            conn.commit()
+                            conn.close()
+                            print(f"Cached {len(candles)} new candles in SQLite database for {req.symbol}")
+                        except Exception as e:
+                            print(f"SQLite writing cache failed: {e}")
+                    return {"status": "success", "data": {"candles": candles}}
+                else:
+                    last_err_code = res.get("code", -1)
+                    last_error_msg = res.get("message", "Unknown error")
+                    print(f"Fyers history response error (mode={df_mode}): code={last_err_code}, msg={last_error_msg}")
+
+                    if last_err_code in [-429, 429] and attempt < max_retries:
+                        import time
+                        time.sleep(2.0 * attempt)
+                        continue
+            except Exception as e:
+                print(f"Exception during Fyers history query (mode={df_mode}): {e}")
+                last_error_msg = str(e)
+                import time
+                time.sleep(1.0)
+
+    COMMON_ERRORS = {
+        -8: "Token is Expired. Please regenerate the token.",
+        -15: "Invalid token. Please regenerate the token.",
+        -16: "Server unable to authenticate token. Please authenticate again.",
+        -17: "Token is Invalid or Expired. Please authenticate again.",
+        -50: "Invalid parameters passed to Fyers API.",
+        -300: "Invalid symbol provided.",
+        -352: "Invalid App ID provided.",
+        -403: "Data API permission missing or invalid parameters.",
+        -429: "Fyers API rate limit exceeded.",
     }
-
-    # 3. Cache miss: Query Fyers API with retry backoff for rate limits
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            print(f"Querying Fyers history API: {data} (Attempt {attempt}/{max_retries})")
-            res = fyers.history(data=data)
-            if res.get("s") == "ok":
-                candles = res.get("candles", [])
-                # Write to SQLite Cache asynchronously
-                if len(candles) > 0:
-                    try:
-                        conn = sqlite3.connect(config.DB_PATH)
-                        cursor = conn.cursor()
-                        for c in candles:
-                            cursor.execute(
-                                "INSERT OR REPLACE INTO historical_candles (symbol, timestamp, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                (req.symbol, int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), int(c[5]))
-                            )
-                        conn.commit()
-                        conn.close()
-                        print(f"Cached {len(candles)} new candles in SQLite database for {req.symbol}")
-                    except Exception as e:
-                        print(f"SQLite writing cache failed: {e}")
-                return {"status": "success", "data": {"candles": candles}}
-            else:
-                err_code = res.get("code")
-                detail = res.get("message", "Unknown error from Fyers history API")
-                print(f"Fyers history response error on attempt {attempt}: code={err_code}, msg={detail}")
-
-                # Rate limiting or temporary throttling
-                if err_code in [-429, -403, 429] and attempt < max_retries:
-                    import time
-                    time.sleep(2.5 * attempt)
-                    continue
-
-                COMMON_ERRORS = {
-                    -8: "Token is Expired. Please regenerate the token.",
-                    -15: "Invalid token. Please regenerate the token.",
-                    -16: "Server unable to authenticate token. Please authenticate again.",
-                    -17: "Token is Invalid or Expired. Please authenticate again.",
-                    -50: "Invalid parameters passed to Fyers API.",
-                    -300: "Invalid symbol provided.",
-                    -352: "Invalid App ID provided.",
-                    -403: "Invalid date/time parameters or market session window specified.",
-                    -429: "Fyers API rate limit exceeded.",
-                }
-                friendly_desc = COMMON_ERRORS.get(err_code)
-                error_msg = f"{detail} (Code {err_code}: {friendly_desc})" if friendly_desc else f"{detail} (Code {err_code})"
-                raise HTTPException(status_code=400, detail=f"Fyers history query failed: {error_msg}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            if attempt == max_retries:
-                print(f"Fyers client history exception: {e}")
-                raise HTTPException(status_code=500, detail=f"Fyers history query failed with server error: {str(e)}")
-            import time
-            time.sleep(2.0)
+    friendly_desc = COMMON_ERRORS.get(last_err_code)
+    error_msg = f"{last_error_msg} (Code {last_err_code}: {friendly_desc})" if friendly_desc else f"{last_error_msg} (Code {last_err_code})"
+    raise HTTPException(status_code=400, detail=f"Fyers history query failed: {error_msg}")
 

@@ -1804,11 +1804,8 @@ async fn start_background_downloader(db: TimescaleClient, python_broker_url: Str
             let next_job = sqlx::query(
                 "SELECT symbol, from_date, to_date 
                  FROM download_jobs 
-                 WHERE status = 'PENDING' OR status LIKE 'FAILED%' 
-                 ORDER BY 
-                   CASE WHEN status = 'PENDING' THEN 0 ELSE 1 END,
-                   CASE WHEN status = 'PENDING' THEN last_updated END DESC,
-                   last_updated ASC
+                 WHERE status = 'PENDING'
+                 ORDER BY last_updated ASC
                  LIMIT 1"
             )
             .fetch_optional(&db.pool)
