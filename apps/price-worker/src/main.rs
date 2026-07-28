@@ -145,6 +145,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let server_url = std::env::var("SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
+    let orchestrator_arc = Arc::new(tokio::sync::Mutex::new(orchestrator));
+    let crypto_prices_arc = Arc::new(tokio::sync::Mutex::new(HashMap::<String, f64>::new()));
+
+    // 5. Spawn 1-second continuous live status heartbeat task to server
+    {
+        let orch_clone = orchestrator_arc.clone();
+        let crypto_clone = crypto_prices_arc.clone();
+        let client_clone = http_client.clone();
+        let url_clone = format!("{}/live-status", server_url);
+        
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let (nifty, vix, ml, prob, conf, decision, quality, target) = {
+                    let orch = orch_clone.lock().await;
+                    let (prob, conf) = if let Some(ref opt) = orch.last_opportunity {
+                        (opt.probability, opt.confidence)
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    let decision = format!("{:?}", orch.last_decision.unwrap_or(price_strategy::Decision::Wait));
+                    let quality = orch.last_quality.as_ref().map(|q| q.total).unwrap_or(0.0);
+                    let target = orch.last_target_option.clone().unwrap_or_else(|| "--".to_string());
+                    (orch.current_nifty_spot, orch.current_vix, orch.current_ml_confidence, prob, conf, decision, quality, target)
+                };
+
+                let (btc_p, eth_p, sol_p) = {
+                    let cp = crypto_clone.lock().await;
+                    (
+                        cp.get("BTC").copied().unwrap_or(0.0),
+                        cp.get("ETH").copied().unwrap_or(0.0),
+                        cp.get("SOL").copied().unwrap_or(0.0),
+                    )
+                };
+
+                let payload = serde_json::json!({
+                    "nifty_price": nifty,
+                    "vix": vix,
+                    "ml_confidence": ml,
+                    "opportunity_confidence": conf,
+                    "opportunity_probability": prob,
+                    "decision": decision,
+                    "quality_score": quality,
+                    "target_option": target,
+                    "btc_price": btc_p,
+                    "eth_price": eth_p,
+                    "sol_price": sol_p,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+
+                let _ = client_clone.post(&url_clone)
+                    .json(&payload)
+                    .send()
+                    .await;
+            }
+        });
+    }
+
+    // 6. Spawn Delta Exchange live ticker polling task (2-seconds interval)
+    {
+        let crypto_clone = crypto_prices_arc.clone();
+        let delta_client = http_client.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                if let Ok(res) = delta_client.get("https://api.delta.exchange/v2/tickers").send().await {
+                    if let Ok(json_val) = res.json::<serde_json::Value>().await {
+                        if let Some(result_arr) = json_val.get("result").and_then(|r| r.as_array()) {
+                            let mut cp = crypto_clone.lock().await;
+                            for t in result_arr {
+                                if let (Some(sym), Some(price_str)) = (t.get("symbol").and_then(|s| s.as_str()), t.get("mark_price").and_then(|p| p.as_str())) {
+                                    if let Ok(p) = price_str.parse::<f64>() {
+                                        if sym == "BTCUSD_PERP" {
+                                            cp.insert("BTC".to_string(), p);
+                                        } else if sym == "ETHUSD_PERP" {
+                                            cp.insert("ETH".to_string(), p);
+                                        } else if sym == "SOLUSD_PERP" {
+                                            cp.insert("SOL".to_string(), p);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Active Option symbols tracking (strike-based)
     let mut last_subscribed_strike: Option<f64> = None;
 
@@ -161,11 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let (_, mut read) = ws_stream.split();
                 let mut step = 0;
-                let mut last_status_send = std::time::Instant::now();
-                let server_url = std::env::var("SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
-
                 let mut candle_aggregators: HashMap<String, price_indicators::CandleAggregator> = HashMap::new();
-                let mut crypto_prices: HashMap<String, f64> = HashMap::new();
 
                 while let Some(message) = read.next().await {
                     match message {
@@ -176,11 +264,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     
                                     // 1. Process Crypto Ticks & Price Memory
                                     if ws_tick.symbol.contains("BTC") {
-                                        crypto_prices.insert("BTC".to_string(), ws_tick.price);
+                                        crypto_prices_arc.lock().await.insert("BTC".to_string(), ws_tick.price);
                                     } else if ws_tick.symbol.contains("ETH") {
-                                        crypto_prices.insert("ETH".to_string(), ws_tick.price);
+                                        crypto_prices_arc.lock().await.insert("ETH".to_string(), ws_tick.price);
                                     } else if ws_tick.symbol.contains("SOL") {
-                                        crypto_prices.insert("SOL".to_string(), ws_tick.price);
+                                        crypto_prices_arc.lock().await.insert("SOL".to_string(), ws_tick.price);
                                     }
 
                                     // 2. Real-Time Tick-by-Tick OHLC Candle Aggregation
@@ -227,7 +315,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                             }
                                         }
-                                        orchestrator.update_weighted_delta(weighted_delta);
+                                        orchestrator_arc.lock().await.update_weighted_delta(weighted_delta);
                                         debug!("Stock constituent tick: {}. Price: {}. New Weighted Delta: {:.6}", 
                                             ws_tick.symbol, ws_tick.price, weighted_delta);
                                     }
@@ -282,69 +370,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     };
 
                                     if ws_tick.symbol == "NSE:NIFTY50-INDEX" || ws_tick.symbol == "NSE:INDIAVIX-INDEX" || is_active_option {
-                                        match orchestrator.ingest_tick(tick).await {
-                                            Ok(events) => {
-                                                for event in events {
-                                                    debug!("Engine Event: {:?}", event);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!("Live ingestion step {} error: {:?}", step, e);
-                                            }
-                                        }
+                                         match orchestrator_arc.lock().await.ingest_tick(tick).await {
+                                             Ok(events) => {
+                                                 for event in events {
+                                                     debug!("Engine Event: {:?}", event);
+                                                 }
+                                             }
+                                             Err(e) => {
+                                                 error!("Live ingestion step {} error: {:?}", step, e);
+                                             }
+                                         }
+                                     }
 
-                                    }
-
-                                    // Send status update to server once per second on any incoming tick
-                                    if last_status_send.elapsed() >= Duration::from_millis(1000) {
-                                        last_status_send = std::time::Instant::now();
-                                        
-                                        let (prob, conf) = if let Some(ref opt) = orchestrator.last_opportunity {
-                                            (opt.probability, opt.confidence)
-                                        } else {
-                                            (0.0, 0.0)
-                                        };
-                                        
-                                        let decision = format!("{:?}", orchestrator.last_decision.unwrap_or(price_strategy::Decision::Wait));
-                                        let quality = orchestrator.last_quality.as_ref().map(|q| q.total).unwrap_or(0.0);
-                                        let target = orchestrator.last_target_option.clone().unwrap_or_else(|| "--".to_string());
-
-                                        let payload = serde_json::json!({
-                                            "nifty_price": orchestrator.current_nifty_spot,
-                                            "vix": orchestrator.current_vix,
-                                            "ml_confidence": orchestrator.current_ml_confidence,
-                                            "opportunity_confidence": conf,
-                                            "opportunity_probability": prob,
-                                            "decision": decision,
-                                            "quality_score": quality,
-                                            "target_option": target,
-                                            "btc_price": crypto_prices.get("BTC").copied().unwrap_or(0.0),
-                                            "eth_price": crypto_prices.get("ETH").copied().unwrap_or(0.0),
-                                            "sol_price": crypto_prices.get("SOL").copied().unwrap_or(0.0),
-                                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                                        });
-
-                                        let client_clone = http_client.clone();
-                                        let url_clone = format!("{}/live-status", server_url);
-                                        tokio::spawn(async move {
-                                            let _ = client_clone.post(&url_clone)
-                                                .json(&payload)
-                                                .send()
-                                                .await;
-                                        });
-                                    }
-
-                                    // Log status updates periodically
-                                    if step % 100 == 0 {
-                                        let (trades, pnl) = orchestrator.get_risk_status();
-                                        info!(
-                                            "[LIVE STATUS] Ticks Ingested: {} | Active Trades: {} | Daily PnL: {:.2} | Position: {}",
-                                            step,
-                                            trades,
-                                            pnl,
-                                            if orchestrator.active_position().is_some() { "YES" } else { "NO" }
-                                        );
-                                    }
+                                     // Log status updates periodically
+                                     if step % 100 == 0 {
+                                         let orch = orchestrator_arc.lock().await;
+                                         let (trades, pnl) = orch.get_risk_status();
+                                         let has_pos = orch.active_position().is_some();
+                                         info!(
+                                             "[LIVE STATUS] Ticks Ingested: {} | Active Trades: {} | Daily PnL: {:.2} | Position: {}",
+                                             step,
+                                             trades,
+                                             pnl,
+                                             if has_pos { "YES" } else { "NO" }
+                                         );
+                                     }
                                 }
                             }
                         }
