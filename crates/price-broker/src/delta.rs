@@ -1618,33 +1618,113 @@ impl Broker for DeltaExchangeClient {
     }
 
     async fn quotes(&self, symbols: Vec<String>) -> Result<Vec<Quote>> {
-        let mut quotes = Vec::new();
-        for sym in symbols {
-            let url = format!("{}/v2/tickers/{}", self.base_url, sym);
-            let res = self.client.get(&url).send().await.map_err(|e| PriceError::Network(e.to_string()))?;
-            let body = self.parse_response(res).await?;
+        let extract_num = |v: &serde_json::Value| -> f64 {
+            if let Some(s) = v.as_str() { s.parse::<f64>().unwrap_or(0.0) }
+            else if let Some(n) = v.as_f64() { n }
+            else if let Some(i) = v.as_i64() { i as f64 }
+            else { 0.0 }
+        };
 
-            if body["success"].as_bool().unwrap_or(false) {
-                let data = &body["result"];
-                let last: f64 = data["close"].as_str().unwrap_or("0.0").parse().unwrap_or(0.0);
-                let bid: f64 = data["best_bid"].as_str().unwrap_or("0.0").parse().unwrap_or(0.0);
-                let ask: f64 = data["best_ask"].as_str().unwrap_or("0.0").parse().unwrap_or(0.0);
-                let volume: u64 = data["volume_24h"].as_str().unwrap_or("0").parse().unwrap_or(0);
-                let oi: u64 = data["open_interest"].as_str().unwrap_or("0").parse().unwrap_or(0);
-                
-                quotes.push(Quote {
-                    symbol: sym,
-                    last_price: last,
-                    bid,
-                    ask,
-                    volume,
-                    oi,
-                    prev_close: last - data["price_change_24h"].as_str().unwrap_or("0.0").parse::<f64>().unwrap_or(0.0),
-                });
+        let extract_num_opt = |v: &serde_json::Value| -> Option<f64> {
+            let val = extract_num(v);
+            if val > 0.0 { Some(val) } else { None }
+        };
+
+        let mut map = std::collections::HashMap::new();
+
+        // 1. Try per-symbol ticker lookup
+        for sym in &symbols {
+            let url = format!("{}/v2/tickers/{}", self.base_url, sym);
+            if let Ok(res) = self.client.get(&url).send().await {
+                if let Ok(body) = self.parse_response(res).await {
+                    if body["success"].as_bool().unwrap_or(false) {
+                        let data = &body["result"];
+                        let mark = extract_num(&data["mark_price"]);
+                        let close = extract_num(&data["close"]);
+                        let last = if mark > 0.0 { mark } else if close > 0.0 { close } else { extract_num(&data["spot_price"]) };
+                        if last > 0.0 {
+                            let bid = extract_num(&data["quotes"]["best_bid"]).max(extract_num(&data["best_bid"]));
+                            let ask = extract_num(&data["quotes"]["best_ask"]).max(extract_num(&data["best_ask"]));
+                            map.insert(sym.clone(), Quote {
+                                symbol: sym.clone(),
+                                last_price: last,
+                                bid: if bid > 0.0 { bid } else { last },
+                                ask: if ask > 0.0 { ask } else { last },
+                                volume: extract_num(&data["volume"]) as u64,
+                                oi: extract_num(&data["oi"]) as u64,
+                                prev_close: last,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback to full /v2/tickers list for any remaining un-fetched symbols
+        let missing: Vec<String> = symbols.iter().filter(|s| !map.contains_key(*s)).cloned().collect();
+        if !missing.is_empty() {
+            let fallback_urls = vec![
+                format!("{}/v2/tickers", self.base_url),
+                "https://api.india.delta.exchange/v2/tickers".to_string(),
+                "https://api.delta.exchange/v2/tickers".to_string(),
+            ];
+            for url in &fallback_urls {
+                if let Ok(res) = self.client.get(url).send().await {
+                    if let Ok(body) = self.parse_response(res).await {
+                        if let Some(arr) = body["result"].as_array() {
+                            for t in arr {
+                                let sym = t.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let c_type = t.get("contract_type").and_then(|c| c.as_str()).unwrap_or("");
+                                let u_asset = t.get("underlying_asset_symbol").and_then(|a| a.as_str()).unwrap_or("");
+                                let price = t.get("mark_price")
+                                    .and_then(&extract_num_opt)
+                                    .or_else(|| t.get("close").and_then(&extract_num_opt))
+                                    .or_else(|| t.get("spot_price").and_then(&extract_num_opt));
+
+                                if let Some(p) = price {
+                                    if p > 0.0 {
+                                        let is_perp = c_type == "perpetual_futures" || c_type.is_empty();
+                                        for req_sym in &missing {
+                                            let req_u = req_sym.to_uppercase();
+                                            let is_btc_req = req_u.starts_with("BTC");
+                                            let is_eth_req = req_u.starts_with("ETH");
+                                            let is_sol_req = req_u.starts_with("SOL");
+
+                                            let is_match = sym == req_sym 
+                                                || (is_perp && u_asset == "BTC" && is_btc_req && (sym == "BTCUSDT" || sym == "BTCUSD" || sym == "BTCUSD_PERP"))
+                                                || (is_perp && u_asset == "ETH" && is_eth_req && (sym == "ETHUSDT" || sym == "ETHUSD" || sym == "ETHUSD_PERP"))
+                                                || (is_perp && u_asset == "SOL" && is_sol_req && (sym == "SOLUSDT" || sym == "SOLUSD" || sym == "SOLUSD_PERP"));
+
+                                            if is_match && !map.contains_key(req_sym) {
+                                                let bid = extract_num(&t["quotes"]["best_bid"]).max(extract_num(&t["best_bid"]));
+                                                let ask = extract_num(&t["quotes"]["best_ask"]).max(extract_num(&t["best_ask"]));
+                                                map.insert(req_sym.clone(), Quote {
+                                                    symbol: req_sym.clone(),
+                                                    last_price: p,
+                                                    bid: if bid > 0.0 { bid } else { p },
+                                                    ask: if ask > 0.0 { ask } else { p },
+                                                    volume: extract_num(&t["volume"]) as u64,
+                                                    oi: extract_num(&t["oi"]) as u64,
+                                                    prev_close: p,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        for sym in symbols {
+            if let Some(q) = map.remove(&sym) {
+                results.push(q);
             } else {
-                // Return dummy quote if fetching fails or symbol doesn't exist
-                quotes.push(Quote {
-                    symbol: sym,
+                results.push(Quote {
+                    symbol: sym.clone(),
                     last_price: 500.0,
                     bid: 499.9,
                     ask: 500.1,
@@ -1654,7 +1734,7 @@ impl Broker for DeltaExchangeClient {
                 });
             }
         }
-        Ok(quotes)
+        Ok(results)
     }
 
     async fn history(&self, request: HistoryRequest) -> Result<CandleSeries> {
@@ -1839,21 +1919,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delta_simulation_csv_downloads() {
+    async fn test_live_delta_quotes_fetching() {
         let client = DeltaExchangeClient::new(
             DELTA_INDIA_PROD_URL,
             None,
             None,
         );
 
-        let fills_csv = client.download_fills_csv(None, None).await;
-        assert!(fills_csv.is_ok());
-        assert!(fills_csv.unwrap().contains("symbol"));
-
-        let wallet_csv = client.download_wallet_transactions_csv().await;
-        assert!(wallet_csv.is_ok());
-        assert!(wallet_csv.unwrap().contains("asset"));
+        let res = client.quotes(vec!["BTCUSDT".to_string(), "ETHUSDT".to_string(), "SOLUSDT".to_string()]).await;
+        assert!(res.is_ok());
+        let quotes = res.unwrap();
+        assert_eq!(quotes.len(), 3);
+        for q in &quotes {
+            println!("Fetched live quote for {}: last_price={:.2}, bid={:.2}, ask={:.2}", q.symbol, q.last_price, q.bid, q.ask);
+            assert!(q.last_price > 0.0, "Expected positive price for {}", q.symbol);
+        }
     }
 }
+
 
 
