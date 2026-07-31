@@ -203,6 +203,10 @@ impl Broker for ReplayBroker {
                 avg_price: execution_price,
                 current_price: execution_price,
                 pnl: 0.0,
+                product_id: None,
+                liquidation_price: None,
+                leverage: None,
+                margin: None,
             });
         }
 

@@ -280,6 +280,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         volume: ws_tick.volume,
                                         oi: ws_tick.oi,
                                         timestamp: tick_time,
+                                        bid: None,
+                                        ask: None,
+                                        mark_price: None,
                                     };
 
                                     let agg = candle_aggregators.entry(ws_tick.symbol.clone())

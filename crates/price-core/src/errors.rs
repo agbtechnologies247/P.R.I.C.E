@@ -37,6 +37,16 @@ pub enum PriceError {
 
     #[error("Indian market is closed. Trades can only be placed Mon-Fri 09:15 - 15:30 IST (excluding holidays).")]
     MarketClosed,
+
+    #[error("Rate limit exceeded. Retry after {retry_after_ms}ms. Quota used: {quota_used}/{quota_limit}")]
+    RateLimitExceeded {
+        retry_after_ms: u64,
+        quota_used: u64,
+        quota_limit: u64,
+    },
+
+    #[error("API signature expired. Server time drift detected: {0}")]
+    SignatureExpired(String),
 }
 
 pub type Result<T> = std::result::Result<T, PriceError>;

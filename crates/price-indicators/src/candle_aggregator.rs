@@ -61,6 +61,9 @@ mod tests {
             volume: 10,
             oi: 1000,
             timestamp: Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 0).unwrap(),
+            bid: None,
+            ask: None,
+            mark_price: None,
         };
 
         let t2 = TickData {
@@ -69,6 +72,9 @@ mod tests {
             volume: 15,
             oi: 1000,
             timestamp: Utc.with_ymd_and_hms(2026, 7, 25, 12, 0, 30).unwrap(),
+            bid: None,
+            ask: None,
+            mark_price: None,
         };
 
         let t3 = TickData {
@@ -77,6 +83,9 @@ mod tests {
             volume: 5,
             oi: 1000,
             timestamp: Utc.with_ymd_and_hms(2026, 7, 25, 12, 1, 0).unwrap(),
+            bid: None,
+            ask: None,
+            mark_price: None,
         };
 
         use chrono::Utc;

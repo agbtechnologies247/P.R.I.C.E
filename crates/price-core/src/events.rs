@@ -8,6 +8,15 @@ pub struct TickData {
     pub volume: u64,
     pub oi: u64,
     pub timestamp: DateTime<Utc>,
+    /// Best bid price (if available from L1 data)
+    #[serde(default)]
+    pub bid: Option<f64>,
+    /// Best ask price (if available from L1 data)
+    #[serde(default)]
+    pub ask: Option<f64>,
+    /// Mark price for derivatives (used for liquidation calculations)
+    #[serde(default)]
+    pub mark_price: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

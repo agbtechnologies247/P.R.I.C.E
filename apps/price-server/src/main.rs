@@ -1743,6 +1743,8 @@ async fn place_order_handler(
         leverage: None,
         reduce_only: None,
         post_only: None,
+        client_id: None,
+        time_in_force: None,
     };
     
     match state.broker.place_order(req).await {

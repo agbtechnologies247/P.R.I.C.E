@@ -109,6 +109,9 @@ impl ReplayRunner {
                 volume: 0,
                 oi: 0,
                 timestamp: current_dt,
+                bid: None,
+                ask: None,
+                mark_price: None,
             };
             let _ = orchestrator.ingest_tick(vix_tick).await?;
 
@@ -120,6 +123,9 @@ impl ReplayRunner {
                 volume: sc.volume,
                 oi: 0,
                 timestamp: current_dt,
+                bid: None,
+                ask: None,
+                mark_price: None,
             };
             let _ = orchestrator.ingest_tick(spot_tick).await?;
 

@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use dashmap::DashMap;
 use async_trait::async_trait;
 use price_core::{Result, PriceError, is_indian_market_hours};

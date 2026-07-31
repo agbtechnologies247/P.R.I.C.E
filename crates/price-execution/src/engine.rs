@@ -280,6 +280,8 @@ impl ExecutionOrchestrator {
                     leverage: if is_delta { Some(10) } else { None },
                     reduce_only: Some(true),
                     post_only: None,
+                    client_id: None,
+                    time_in_force: None,
                 };
 
                 match self.broker.place_order(exit_request).await {
@@ -511,6 +513,8 @@ impl ExecutionOrchestrator {
                             leverage: if is_delta { Some(leverage_to_use) } else { None },
                             reduce_only: None,
                             post_only: if use_limit_order && is_delta { Some(false) } else { None },
+                            client_id: None,
+                            time_in_force: None,
                         };
 
                         match self.risk_engine.validate_order(&order_request, &funds) {
@@ -570,6 +574,10 @@ impl ExecutionOrchestrator {
                                             avg_price: option_price,
                                             current_price: option_price,
                                             pnl: 0.0,
+                                            product_id: None,
+                                            liquidation_price: None,
+                                            leverage: None,
+                                            margin: None,
                                         });
 
                                         self.entry_price = option_price;

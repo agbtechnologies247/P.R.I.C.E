@@ -155,6 +155,10 @@ mod tests {
                 avg_price: 50000.0,
                 current_price: 51000.0,
                 pnl: 2000.0,
+                product_id: None,
+                liquidation_price: None,
+                leverage: None,
+                margin: None,
             },
             Position {
                 symbol: "ETHUSDT".to_string(),
@@ -164,6 +168,10 @@ mod tests {
                 avg_price: 3000.0,
                 current_price: 2900.0,
                 pnl: 1000.0,
+                product_id: None,
+                liquidation_price: None,
+                leverage: None,
+                margin: None,
             },
         ];
 
@@ -184,6 +192,10 @@ mod tests {
                 avg_price: 50000.0,
                 current_price: 50000.0,
                 pnl: 0.0,
+                product_id: None,
+                liquidation_price: None,
+                leverage: None,
+                margin: None,
             },
         ];
         let lev = manager.calculate_leverage_usage(&positions, 25000.0);
@@ -205,6 +217,8 @@ mod tests {
             leverage: Some(10),
             reduce_only: None,
             post_only: None,
+            client_id: None,
+            time_in_force: None,
         };
 
         let result = manager.validate_portfolio_limits(&positions, &order, 25000.0);
@@ -225,6 +239,8 @@ mod tests {
             leverage: Some(10),
             reduce_only: None,
             post_only: None,
+            client_id: None,
+            time_in_force: None,
         };
 
         // nominal = 100000. balance = 25000 -> future leverage = 4x > 2x limit -> error
@@ -244,6 +260,10 @@ mod tests {
                 avg_price: 3000.0,
                 current_price: 3000.0,
                 pnl: 0.0,
+                product_id: None,
+                liquidation_price: None,
+                leverage: None,
+                margin: None,
             },
         ];
         let order = OrderRequest {
@@ -256,6 +276,8 @@ mod tests {
             leverage: Some(10),
             reduce_only: None,
             post_only: None,
+            client_id: None,
+            time_in_force: None,
         };
 
         let result = manager.validate_portfolio_limits(&positions, &order, 25000.0);
