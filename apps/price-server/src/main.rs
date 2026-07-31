@@ -84,7 +84,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let cp_clone = crypto_prices.clone();
         tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("User-Agent", reqwest::header::HeaderValue::from_static("price-engine-rust"));
+            headers.insert("Accept", reqwest::header::HeaderValue::from_static("application/json"));
+            let client = reqwest::Client::builder()
+                .default_headers(headers)
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             let urls = vec![
                 "https://api.india.delta.exchange/v2/tickers",
@@ -105,18 +113,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let mut cp = cp_clone.lock().await;
                                 for t in arr {
                                     let sym = t.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                    let c_type = t.get("contract_type").and_then(|c| c.as_str()).unwrap_or("");
+                                    let u_asset = t.get("underlying_asset_symbol").and_then(|a| a.as_str()).unwrap_or("");
                                     let price = t.get("mark_price")
                                         .and_then(&extract_p)
                                         .or_else(|| t.get("close").and_then(&extract_p))
-                                        .or_else(|| t.get("spot_price").and_then(&extract_p));
+                                        .or_else(|| t.get("spot_price").and_then(&extract_p))
+                                        .or_else(|| t.get("last_price").and_then(&extract_p));
+
                                     if let Some(p) = price {
                                         if p > 0.0 {
                                             let s_u = sym.to_uppercase();
-                                            if s_u == "BTCUSD" || s_u == "BTCUSD_PERP" || s_u == "BTCUSDT" || s_u == "BTC-PERPETUAL" {
+                                            let is_perp = c_type == "perpetual_futures" || c_type.is_empty();
+                                            let is_btc = (is_perp && u_asset == "BTC") || s_u == "BTCUSDT" || s_u == "BTCUSD" || s_u == "BTCUSD_PERP";
+                                            let is_eth = (is_perp && u_asset == "ETH") || s_u == "ETHUSDT" || s_u == "ETHUSD" || s_u == "ETHUSD_PERP";
+                                            let is_sol = (is_perp && u_asset == "SOL") || s_u == "SOLUSDT" || s_u == "SOLUSD" || s_u == "SOLUSD_PERP";
+
+                                            if is_btc {
                                                 cp.insert("BTC".to_string(), p);
-                                            } else if s_u == "ETHUSD" || s_u == "ETHUSD_PERP" || s_u == "ETHUSDT" || s_u == "ETH-PERPETUAL" {
+                                            } else if is_eth {
                                                 cp.insert("ETH".to_string(), p);
-                                            } else if s_u == "SOLUSD" || s_u == "SOLUSD_PERP" || s_u == "SOLUSDT" || s_u == "SOL-PERPETUAL" {
+                                            } else if is_sol {
                                                 cp.insert("SOL".to_string(), p);
                                             }
                                         }
