@@ -39,6 +39,7 @@ struct AppState {
     python_broker_url: String,
     db: TimescaleClient,
     live_status: RwLock<Option<LiveStatusInfo>>,
+    crypto_prices: Arc<tokio::sync::Mutex<std::collections::HashMap<String, f64>>>,
 }
 
 #[tokio::main]
@@ -69,12 +70,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = TimescaleClient::new(&db_url).await?;
     db.init_db().await?;
 
+    let crypto_prices = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     let state = Arc::new(AppState {
         broker,
         python_broker_url: python_broker_url.clone(),
         db: db.clone(),
         live_status: RwLock::new(None),
+        crypto_prices: crypto_prices.clone(),
     });
+
+    // Spawn server-side ticker polling loop for BTC, ETH, SOL
+    {
+        let cp_clone = crypto_prices.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            let urls = vec![
+                "https://api.india.delta.exchange/v2/tickers",
+                "https://api.delta.exchange/v2/tickers",
+            ];
+            let extract_p = |v: &serde_json::Value| -> Option<f64> {
+                if let Some(s) = v.as_str() { s.parse::<f64>().ok() }
+                else if let Some(n) = v.as_f64() { Some(n) }
+                else if let Some(i) = v.as_i64() { Some(i as f64) }
+                else { None }
+            };
+            loop {
+                interval.tick().await;
+                for url in &urls {
+                    if let Ok(res) = client.get(*url).send().await {
+                        if let Ok(json_val) = res.json::<serde_json::Value>().await {
+                            if let Some(arr) = json_val.get("result").and_then(|r| r.as_array()) {
+                                let mut cp = cp_clone.lock().await;
+                                for t in arr {
+                                    let sym = t.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                    let price = t.get("mark_price")
+                                        .and_then(&extract_p)
+                                        .or_else(|| t.get("close").and_then(&extract_p))
+                                        .or_else(|| t.get("spot_price").and_then(&extract_p));
+                                    if let Some(p) = price {
+                                        if p > 0.0 {
+                                            let s_u = sym.to_uppercase();
+                                            if s_u == "BTCUSD" || s_u == "BTCUSD_PERP" || s_u == "BTCUSDT" || s_u == "BTC-PERPETUAL" {
+                                                cp.insert("BTC".to_string(), p);
+                                            } else if s_u == "ETHUSD" || s_u == "ETHUSD_PERP" || s_u == "ETHUSDT" || s_u == "ETH-PERPETUAL" {
+                                                cp.insert("ETH".to_string(), p);
+                                            } else if s_u == "SOLUSD" || s_u == "SOLUSD_PERP" || s_u == "SOLUSDT" || s_u == "SOL-PERPETUAL" {
+                                                cp.insert("SOL".to_string(), p);
+                                            }
+                                        }
+                                    }
+                                }
+                                if !cp.is_empty() { break; }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Start background downloader task
     start_background_downloader(db.clone(), python_broker_url.clone()).await;
@@ -2221,7 +2276,33 @@ async fn symbol_mappings_handler(
 async fn get_live_status_handler(
     Extension(state): Extension<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let status = state.live_status.read().unwrap().clone();
+    let mut status = state.live_status.read().unwrap().clone();
+    let cp = state.crypto_prices.lock().await;
+    let btc = cp.get("BTC").copied().unwrap_or(0.0);
+    let eth = cp.get("ETH").copied().unwrap_or(0.0);
+    let sol = cp.get("SOL").copied().unwrap_or(0.0);
+
+    if let Some(ref mut info) = status {
+        if info.btc_price == 0.0 && btc > 0.0 { info.btc_price = btc; }
+        if info.eth_price == 0.0 && eth > 0.0 { info.eth_price = eth; }
+        if info.sol_price == 0.0 && sol > 0.0 { info.sol_price = sol; }
+    } else {
+        status = Some(LiveStatusInfo {
+            nifty_price: 0.0,
+            vix: 0.0,
+            ml_confidence: 0.0,
+            opportunity_confidence: 0.0,
+            opportunity_probability: 0.0,
+            decision: "Wait".to_string(),
+            quality_score: 0.0,
+            target_option: "--".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            btc_price: btc,
+            eth_price: eth,
+            sol_price: sol,
+        });
+    }
+
     Json(serde_json::json!({
         "status": "success",
         "live_status": status

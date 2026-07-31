@@ -209,25 +209,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let crypto_clone = crypto_prices_arc.clone();
         let delta_client = http_client.clone();
+        let delta_base_url = std::env::var("DELTA_BASE_URL")
+            .unwrap_or_else(|_| price_broker::DELTA_INDIA_PROD_URL.to_string());
+        
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(2));
+            let urls = vec![
+                format!("{}/v2/tickers", delta_base_url.trim_end_matches('/')),
+                "https://api.india.delta.exchange/v2/tickers".to_string(),
+                "https://api.delta.exchange/v2/tickers".to_string(),
+            ];
+
+            let extract_price = |v: &serde_json::Value| -> Option<f64> {
+                if let Some(s) = v.as_str() {
+                    s.parse::<f64>().ok()
+                } else if let Some(n) = v.as_f64() {
+                    Some(n)
+                } else if let Some(i) = v.as_i64() {
+                    Some(i as f64)
+                } else {
+                    None
+                }
+            };
+
             loop {
                 interval.tick().await;
-                if let Ok(res) = delta_client.get("https://api.delta.exchange/v2/tickers").send().await {
-                    if let Ok(json_val) = res.json::<serde_json::Value>().await {
-                        if let Some(result_arr) = json_val.get("result").and_then(|r| r.as_array()) {
-                            let mut cp = crypto_clone.lock().await;
-                            for t in result_arr {
-                                if let (Some(sym), Some(price_str)) = (t.get("symbol").and_then(|s| s.as_str()), t.get("mark_price").and_then(|p| p.as_str())) {
-                                    if let Ok(p) = price_str.parse::<f64>() {
-                                        if sym == "BTCUSD_PERP" {
-                                            cp.insert("BTC".to_string(), p);
-                                        } else if sym == "ETHUSD_PERP" {
-                                            cp.insert("ETH".to_string(), p);
-                                        } else if sym == "SOLUSD_PERP" {
-                                            cp.insert("SOL".to_string(), p);
+                for url in &urls {
+                    if let Ok(res) = delta_client.get(url).send().await {
+                        if let Ok(json_val) = res.json::<serde_json::Value>().await {
+                            if let Some(result_arr) = json_val.get("result").and_then(|r| r.as_array()) {
+                                let mut cp = crypto_clone.lock().await;
+                                for t in result_arr {
+                                    let sym = t.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                    let price = t.get("mark_price")
+                                        .and_then(&extract_price)
+                                        .or_else(|| t.get("close").and_then(&extract_price))
+                                        .or_else(|| t.get("spot_price").and_then(&extract_price))
+                                        .or_else(|| t.get("last_price").and_then(&extract_price));
+
+                                    if let Some(p) = price {
+                                        if p > 0.0 {
+                                            let s_upper = sym.to_uppercase();
+                                            if s_upper == "BTCUSD" || s_upper == "BTCUSD_PERP" || s_upper == "BTCUSDT" || s_upper == "BTC-PERPETUAL" {
+                                                cp.insert("BTC".to_string(), p);
+                                            } else if s_upper == "ETHUSD" || s_upper == "ETHUSD_PERP" || s_upper == "ETHUSDT" || s_upper == "ETH-PERPETUAL" {
+                                                cp.insert("ETH".to_string(), p);
+                                            } else if s_upper == "SOLUSD" || s_upper == "SOLUSD_PERP" || s_upper == "SOLUSDT" || s_upper == "SOL-PERPETUAL" {
+                                                cp.insert("SOL".to_string(), p);
+                                            }
                                         }
                                     }
+                                }
+                                if !cp.is_empty() {
+                                    break; // Successfully updated from current URL
                                 }
                             }
                         }
