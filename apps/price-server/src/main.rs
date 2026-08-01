@@ -1492,25 +1492,63 @@ async fn index_handler() -> Html<&'static str> {
                 const res = await fetch('/live-status');
                 const data = await res.json();
                 const niftyPulse = document.getElementById('nifty-pulse-dot');
-                if (data.status === 'success' && data.live_status) {
+                    if (data.status === 'success' && data.live_status) {
                     const ls = data.live_status;
                     document.getElementById('live-nifty-val').textContent = `₹${ls.nifty_price.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
                     document.getElementById('live-vix-val').textContent = ls.vix.toFixed(2);
-                    if (ls.btc_price) {
-                        document.getElementById('live-btc-val').textContent = `$${ls.btc_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                        const btcCard = document.getElementById('crypto-btc-card-price');
-                        if (btcCard) btcCard.textContent = `$${ls.btc_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+
+                    // Helper to set crypto price in UI
+                    const setCryptoPrice = (coin, price) => {
+                        if (!price || price <= 0) return;
+                        const fmt = `$${price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                        document.getElementById(`live-${coin}-val`).textContent = fmt;
+                        const card = document.getElementById(`crypto-${coin}-card-price`);
+                        if (card) card.textContent = fmt;
+                    };
+
+                    // Try from live-status first
+                    setCryptoPrice('btc', ls.btc_price);
+                    setCryptoPrice('eth', ls.eth_price);
+                    setCryptoPrice('sol', ls.sol_price);
+
+                    // Fallback: if any crypto price is still 0, fetch from /crypto-prices endpoint
+                    if (!ls.btc_price || !ls.eth_price || !ls.sol_price) {
+                        try {
+                            const cpRes = await fetch('/crypto-prices');
+                            const cpData = await cpRes.json();
+                            if (cpData.status === 'success' && cpData.prices) {
+                                if (!ls.btc_price) setCryptoPrice('btc', cpData.prices.BTC);
+                                if (!ls.eth_price) setCryptoPrice('eth', cpData.prices.ETH);
+                                if (!ls.sol_price) setCryptoPrice('sol', cpData.prices.SOL);
+                            }
+                        } catch(e) {}
                     }
-                    if (ls.eth_price) {
-                        document.getElementById('live-eth-val').textContent = `$${ls.eth_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                        const ethCard = document.getElementById('crypto-eth-card-price');
-                        if (ethCard) ethCard.textContent = `$${ls.eth_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+
+                    // Last resort: direct Delta Exchange API fetch (client-side)
+                    const btcEl = document.getElementById('live-btc-val');
+                    if (btcEl && btcEl.textContent === '$0.00') {
+                        try {
+                            const dRes = await fetch('https://api.delta.exchange/v2/tickers/BTCUSDT');
+                            const dData = await dRes.json();
+                            if (dData.success && dData.result) {
+                                const mp = parseFloat(dData.result.mark_price) || parseFloat(dData.result.close) || 0;
+                                if (mp > 0) setCryptoPrice('btc', mp);
+                            }
+                            const eRes = await fetch('https://api.delta.exchange/v2/tickers/ETHUSDT');
+                            const eData = await eRes.json();
+                            if (eData.success && eData.result) {
+                                const ep = parseFloat(eData.result.mark_price) || parseFloat(eData.result.close) || 0;
+                                if (ep > 0) setCryptoPrice('eth', ep);
+                            }
+                            const sRes = await fetch('https://api.delta.exchange/v2/tickers/SOLUSDT');
+                            const sData = await sRes.json();
+                            if (sData.success && sData.result) {
+                                const sp = parseFloat(sData.result.mark_price) || parseFloat(sData.result.close) || 0;
+                                if (sp > 0) setCryptoPrice('sol', sp);
+                            }
+                        } catch(e) {}
                     }
-                    if (ls.sol_price) {
-                        document.getElementById('live-sol-val').textContent = `$${ls.sol_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                        const solCard = document.getElementById('crypto-sol-card-price');
-                        if (solCard) solCard.textContent = `$${ls.sol_price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                    }
+
                     updateCryptoCalc();
                     
                     document.getElementById('opp-target-option').textContent = ls.target_option;
