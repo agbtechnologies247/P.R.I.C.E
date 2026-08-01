@@ -84,16 +84,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let cp_clone = crypto_prices.clone();
         tokio::spawn(async move {
+            info!("[CryptoTicker] Starting server-side Delta Exchange ticker polling loop...");
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert("User-Agent", reqwest::header::HeaderValue::from_static("price-engine-rust"));
             headers.insert("Accept", reqwest::header::HeaderValue::from_static("application/json"));
             let client = reqwest::Client::builder()
                 .default_headers(headers)
-                .timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new());
 
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
             let urls = vec![
                 "https://api.india.delta.exchange/v2/tickers",
                 "https://api.delta.exchange/v2/tickers",
@@ -104,45 +105,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 else if let Some(i) = v.as_i64() { Some(i as f64) }
                 else { None }
             };
+            let mut tick_count: u64 = 0;
             loop {
                 interval.tick().await;
+                tick_count += 1;
+                let mut fetched = false;
                 for url in &urls {
-                    if let Ok(res) = client.get(*url).send().await {
-                        if let Ok(json_val) = res.json::<serde_json::Value>().await {
-                            if let Some(arr) = json_val.get("result").and_then(|r| r.as_array()) {
-                                let mut cp = cp_clone.lock().await;
-                                for t in arr {
-                                    let sym = t.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                    let c_type = t.get("contract_type").and_then(|c| c.as_str()).unwrap_or("");
-                                    let u_asset = t.get("underlying_asset_symbol").and_then(|a| a.as_str()).unwrap_or("");
-                                    let price = t.get("mark_price")
-                                        .and_then(&extract_p)
-                                        .or_else(|| t.get("close").and_then(&extract_p))
-                                        .or_else(|| t.get("spot_price").and_then(&extract_p))
-                                        .or_else(|| t.get("last_price").and_then(&extract_p));
+                    match client.get(*url).send().await {
+                        Ok(res) => {
+                            let status = res.status();
+                            match res.json::<serde_json::Value>().await {
+                                Ok(json_val) => {
+                                    if let Some(arr) = json_val.get("result").and_then(|r| r.as_array()) {
+                                        let mut cp = cp_clone.lock().await;
+                                        for t in arr {
+                                            let sym = t.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                            let c_type = t.get("contract_type").and_then(|c| c.as_str()).unwrap_or("");
+                                            let u_asset = t.get("underlying_asset_symbol").and_then(|a| a.as_str()).unwrap_or("");
+                                            let price = t.get("mark_price")
+                                                .and_then(&extract_p)
+                                                .or_else(|| t.get("close").and_then(&extract_p))
+                                                .or_else(|| t.get("spot_price").and_then(&extract_p))
+                                                .or_else(|| t.get("last_price").and_then(&extract_p));
 
-                                    if let Some(p) = price {
-                                        if p > 0.0 {
-                                            let s_u = sym.to_uppercase();
-                                            let is_perp = c_type == "perpetual_futures" || c_type.is_empty();
-                                            let is_btc = (is_perp && u_asset == "BTC") || s_u == "BTCUSDT" || s_u == "BTCUSD" || s_u == "BTCUSD_PERP";
-                                            let is_eth = (is_perp && u_asset == "ETH") || s_u == "ETHUSDT" || s_u == "ETHUSD" || s_u == "ETHUSD_PERP";
-                                            let is_sol = (is_perp && u_asset == "SOL") || s_u == "SOLUSDT" || s_u == "SOLUSD" || s_u == "SOLUSD_PERP";
+                                            if let Some(p) = price {
+                                                if p > 0.0 {
+                                                    let is_perp = c_type == "perpetual_futures";
+                                                    let is_btc = is_perp && (sym == "BTCUSDT" || sym == "BTCUSD" || sym == "BTCUSD_PERP") && u_asset == "BTC";
+                                                    let is_eth = is_perp && (sym == "ETHUSDT" || sym == "ETHUSD" || sym == "ETHUSD_PERP") && u_asset == "ETH";
+                                                    let is_sol = is_perp && (sym == "SOLUSDT" || sym == "SOLUSD" || sym == "SOLUSD_PERP") && u_asset == "SOL";
 
-                                            if is_btc {
-                                                cp.insert("BTC".to_string(), p);
-                                            } else if is_eth {
-                                                cp.insert("ETH".to_string(), p);
-                                            } else if is_sol {
-                                                cp.insert("SOL".to_string(), p);
+                                                    if is_btc {
+                                                        cp.insert("BTC".to_string(), p);
+                                                    } else if is_eth {
+                                                        cp.insert("ETH".to_string(), p);
+                                                    } else if is_sol {
+                                                        cp.insert("SOL".to_string(), p);
+                                                    }
+                                                }
                                             }
                                         }
+                                        if !cp.is_empty() {
+                                            if tick_count <= 3 || tick_count % 100 == 0 {
+                                                info!("[CryptoTicker] tick={} url={} tickers={} BTC={:.2} ETH={:.2} SOL={:.2}", 
+                                                    tick_count, url, arr.len(),
+                                                    cp.get("BTC").copied().unwrap_or(0.0),
+                                                    cp.get("ETH").copied().unwrap_or(0.0),
+                                                    cp.get("SOL").copied().unwrap_or(0.0));
+                                            }
+                                            fetched = true;
+                                            break;
+                                        }
+                                    } else if tick_count <= 5 {
+                                        info!("[CryptoTicker] tick={} url={} status={} no 'result' array in response", tick_count, url, status);
                                     }
                                 }
-                                if !cp.is_empty() { break; }
+                                Err(e) => {
+                                    if tick_count <= 5 {
+                                        info!("[CryptoTicker] tick={} url={} JSON parse error: {}", tick_count, url, e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if tick_count <= 5 {
+                                info!("[CryptoTicker] tick={} url={} HTTP error: {}", tick_count, url, e);
                             }
                         }
                     }
+                }
+                if !fetched && tick_count <= 5 {
+                    info!("[CryptoTicker] tick={} WARN: no prices fetched from any URL", tick_count);
                 }
             }
         });
@@ -174,6 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/journals/ml", get(journals_ml_handler))
         .route("/research/performance", get(research_performance_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/crypto-prices", get(crypto_prices_handler))
         .route("/favicon.ico", get(favicon_handler))
         .layer(Extension(state));
 
@@ -1753,11 +1787,31 @@ async fn favicon_handler() -> impl IntoResponse {
 
 async fn health_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serde_json::Value> {
     let broker_ok = state.broker.profile().await.is_ok();
+    let cp = state.crypto_prices.lock().await;
     Json(serde_json::json!({
         "status": "healthy",
         "broker_connection": if broker_ok { "connected" } else { "offline_simulated" },
         "system": "PRICE Predictive Risk Intelligence & Capital Engine",
-        "version": "1.0.0"
+        "version": "1.1.0",
+        "crypto_cache": {
+            "btc": cp.get("BTC").copied().unwrap_or(0.0),
+            "eth": cp.get("ETH").copied().unwrap_or(0.0),
+            "sol": cp.get("SOL").copied().unwrap_or(0.0)
+        }
+    }))
+}
+
+async fn crypto_prices_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serde_json::Value> {
+    let cp = state.crypto_prices.lock().await;
+    Json(serde_json::json!({
+        "status": "success",
+        "prices": {
+            "BTC": cp.get("BTC").copied().unwrap_or(0.0),
+            "ETH": cp.get("ETH").copied().unwrap_or(0.0),
+            "SOL": cp.get("SOL").copied().unwrap_or(0.0)
+        },
+        "cache_size": cp.len(),
+        "timestamp": chrono::Utc::now().to_rfc3339()
     }))
 }
 
