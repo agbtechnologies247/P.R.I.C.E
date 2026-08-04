@@ -120,8 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let mut cp = cp_clone.lock().await;
                                         for t in arr {
                                             let sym = t.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                            let c_type = t.get("contract_type").and_then(|c| c.as_str()).unwrap_or("");
-                                            let u_asset = t.get("underlying_asset_symbol").and_then(|a| a.as_str()).unwrap_or("");
+                                            let _c_type = t.get("contract_type").and_then(|c| c.as_str()).unwrap_or("");
+                                            let _u_asset = t.get("underlying_asset_symbol").and_then(|a| a.as_str()).unwrap_or("");
                                             let price = t.get("mark_price")
                                                 .and_then(&extract_p)
                                                 .or_else(|| t.get("close").and_then(&extract_p))
@@ -130,10 +130,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                             if let Some(p) = price {
                                                 if p > 0.0 {
-                                                    let is_perp = c_type == "perpetual_futures";
-                                                    let is_btc = is_perp && (sym == "BTCUSDT" || sym == "BTCUSD" || sym == "BTCUSD_PERP") && u_asset == "BTC";
-                                                    let is_eth = is_perp && (sym == "ETHUSDT" || sym == "ETHUSD" || sym == "ETHUSD_PERP") && u_asset == "ETH";
-                                                    let is_sol = is_perp && (sym == "SOLUSDT" || sym == "SOLUSD" || sym == "SOLUSD_PERP") && u_asset == "SOL";
+                                                    // Match the actual symbols Delta Exchange returns for perpetuals
+                                                    let is_btc = sym == "BTCUSD_PERP" || sym == "BTCUSDT" || sym == "BTCUSD";
+                                                    let is_eth = sym == "ETHUSD_PERP" || sym == "ETHUSDT" || sym == "ETHUSD";
+                                                    let is_sol = sym == "SOLUSD_PERP" || sym == "SOLUSDT" || sym == "SOLUSD";
 
                                                     if is_btc {
                                                         cp.insert("BTC".to_string(), p);
@@ -569,8 +569,6 @@ async fn index_handler() -> Html<&'static str> {
         <button class="nav-tab active" onclick="switchTab('tab-live', this)">📈 Live Dashboard</button>
         <button class="nav-tab" onclick="switchTab('tab-journals', this)">📔 Enterprise Journals</button>
         <button class="nav-tab" onclick="switchTab('tab-research', this)">🔬 Research & Analytics</button>
-        <button class="nav-tab" onclick="switchTab('tab-crypto', this)">⚡ Crypto Perpetuals (Delta Exchange)</button>
-        <button class="nav-tab" onclick="switchTab('tab-symbols', this)">⚙️ Symbol Mappings & Crypto</button>
         <button class="nav-tab" onclick="switchTab('tab-downloader', this)">📥 Data Downloader</button>
     </div>
 
@@ -787,30 +785,7 @@ async fn index_handler() -> Html<&'static str> {
         </div>
     </div>
 
-    <!-- TAB 4: Symbol Mappings & Crypto Futures -->
-    <div id="tab-symbols" class="tab-content">
-        <div class="card">
-            <div class="card-title">Unified Symbol Registry & Delta Crypto Futures</div>
-            <table id="symbol-mappings-table">
-                <thead>
-                    <tr>
-                        <th>Canonical Symbol</th>
-                        <th>Broker Name</th>
-                        <th>Broker Symbol</th>
-                        <th>Exchange</th>
-                        <th>Asset Class</th>
-                        <th>Tick Size</th>
-                        <th>Max Leverage</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td colspan="7" style="text-align: center; color: var(--text-muted);">Loading symbol mappings...</td>
-                    </tr>
-                </tbody>
-            </table>
-        </div>
-    </div>
+    <!-- TAB 4: Symbol Mappings removed - handled by automated system -->
 
     <!-- TAB 5: Historical Data Downloader -->
     <div id="tab-downloader" class="tab-content">
@@ -878,8 +853,8 @@ async fn index_handler() -> Html<&'static str> {
         </div>
     </div>
 
-    <!-- TAB: Crypto Perpetuals (Delta Exchange) -->
-    <div id="tab-crypto" class="tab-content">
+    <!-- TAB: Crypto Perpetuals removed - handled by automated opportunity system -->
+    <div id="tab-crypto" class="tab-content" style="display:none!important">
         <!-- Live Crypto Market Cards -->
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 1.25rem; margin-bottom: 1.5rem;">
             <!-- BTC Card -->
@@ -1054,60 +1029,22 @@ async fn index_handler() -> Html<&'static str> {
             if (tabId === 'tab-crypto') fetchCryptoLiveQuotes();
         }
 
+        // Fetch crypto prices from our server (avoids CORS issues with direct Delta Exchange calls)
         async function fetchCryptoLiveQuotes() {
             try {
-                const res = await fetch('https://api.delta.exchange/v2/tickers');
+                const res = await fetch('/crypto-prices');
                 const data = await res.json();
-                if (data.success && data.result) {
-                    data.result.forEach(t => {
-                        if (t.symbol === 'BTCUSD_PERP') {
-                            const p = parseFloat(t.mark_price) || 0;
-                            const h = parseFloat(t.high) || 0;
-                            const l = parseFloat(t.low) || 0;
-                            const fr = (parseFloat(t.funding_rate) * 100) || 0.01;
-                            document.getElementById('live-btc-val').textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const c = document.getElementById('crypto-btc-card-price');
-                            if (c) c.textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const hElem = document.getElementById('crypto-btc-high');
-                            if (hElem) hElem.textContent = `$${h.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const lElem = document.getElementById('crypto-btc-low');
-                            if (lElem) lElem.textContent = `$${l.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const fElem = document.getElementById('crypto-btc-funding');
-                            if (fElem) fElem.textContent = `${fr >= 0 ? '+' : ''}${fr.toFixed(4)}%`;
-                        } else if (t.symbol === 'ETHUSD_PERP') {
-                            const p = parseFloat(t.mark_price) || 0;
-                            const h = parseFloat(t.high) || 0;
-                            const l = parseFloat(t.low) || 0;
-                            const fr = (parseFloat(t.funding_rate) * 100) || 0.01;
-                            document.getElementById('live-eth-val').textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const c = document.getElementById('crypto-eth-card-price');
-                            if (c) c.textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const hElem = document.getElementById('crypto-eth-high');
-                            if (hElem) hElem.textContent = `$${h.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const lElem = document.getElementById('crypto-eth-low');
-                            if (lElem) lElem.textContent = `$${l.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const fElem = document.getElementById('crypto-eth-funding');
-                            if (fElem) fElem.textContent = `${fr >= 0 ? '+' : ''}${fr.toFixed(4)}%`;
-                        } else if (t.symbol === 'SOLUSD_PERP') {
-                            const p = parseFloat(t.mark_price) || 0;
-                            const h = parseFloat(t.high) || 0;
-                            const l = parseFloat(t.low) || 0;
-                            const fr = (parseFloat(t.funding_rate) * 100) || 0.01;
-                            document.getElementById('live-sol-val').textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const c = document.getElementById('crypto-sol-card-price');
-                            if (c) c.textContent = `$${p.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const hElem = document.getElementById('crypto-sol-high');
-                            if (hElem) hElem.textContent = `$${h.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const lElem = document.getElementById('crypto-sol-low');
-                            if (lElem) lElem.textContent = `$${l.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
-                            const fElem = document.getElementById('crypto-sol-funding');
-                            if (fElem) fElem.textContent = `${fr >= 0 ? '+' : ''}${fr.toFixed(4)}%`;
-                        }
-                    });
-                    updateCryptoCalc();
+                if (data.status === 'success' && data.prices) {
+                    const fmt = (v) => `$${(v || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    const btc = data.prices.BTC || 0;
+                    const eth = data.prices.ETH || 0;
+                    const sol = data.prices.SOL || 0;
+                    if (btc > 0) document.getElementById('live-btc-val').textContent = fmt(btc);
+                    if (eth > 0) document.getElementById('live-eth-val').textContent = fmt(eth);
+                    if (sol > 0) document.getElementById('live-sol-val').textContent = fmt(sol);
                 }
             } catch (e) {
-                console.error("Error fetching crypto tickers: ", e);
+                console.error("Error fetching crypto prices: ", e);
             }
         }
 
@@ -1806,7 +1743,7 @@ async fn index_handler() -> Html<&'static str> {
         fetchCandlesPreview();
         
         setInterval(fetchLiveStatus, 1000);
-        setInterval(fetchCryptoLiveQuotes, 2000);
+        setInterval(fetchCryptoLiveQuotes, 3000);
         setInterval(() => {
             fetchPortfolio();
             fetchOrders();
