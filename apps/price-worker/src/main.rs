@@ -477,15 +477,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     symbol: sym.clone(),
                                     qty: contracts,
                                     side: close_side,
-                                    order_type: price_broker::OrderType::Market,
-                                    limit_price: None,
-                                    stop_price: None,
-                                    product_type: None,
-                                    validity: None,
-                                    disclosed_qty: None,
-                                    offline_order: None,
+                                    r#type: 2, // Market order
+                                    limit_price: 0.0,
+                                    stop_price: 0.0,
+                                    leverage: None,
+                                    reduce_only: Some(true),
+                                    post_only: None,
+                                    client_id: None,
+                                    time_in_force: None,
                                 };
-                                match lc.place_order(&close_req).await {
+                                match lc.place_order(close_req).await {
                                     Ok(resp) => info!("[DeltaLoop][{}] LIVE EXIT order placed: {}", sym, resp.order_id),
                                     Err(e)   => warn!("[DeltaLoop][{}] LIVE EXIT order failed: {:?}", sym, e),
                                 }
@@ -522,7 +523,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 product_id: prod_id,
                                 side: entry_side.clone(),
                                 size: contracts,
-                                order_type: price_broker::OrderType::Market,
+                                order_type: price_broker::OrderType::MarketOrder,
                                 limit_price: None,
                                 stop_price: None,
                                 stop_loss_price: sl_price,
@@ -544,15 +545,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 symbol: sym.clone(),
                                 qty: contracts,
                                 side: entry_side,
-                                order_type: price_broker::OrderType::Market,
-                                limit_price: None,
-                                stop_price: None,
-                                product_type: None,
-                                validity: None,
-                                disclosed_qty: None,
-                                offline_order: None,
+                                r#type: 2, // Market order
+                                limit_price: 0.0,
+                                stop_price: 0.0,
+                                leverage: None,
+                                reduce_only: None,
+                                post_only: None,
+                                client_id: None,
+                                time_in_force: None,
                             };
-                            match pc.place_order(&paper_req).await {
+                            match pc.place_order(paper_req).await {
                                 Ok(resp) => info!("[DeltaLoop][{}] PAPER ENTRY order placed: {}", sym, resp.order_id),
                                 Err(e)   => warn!("[DeltaLoop][{}] PAPER ENTRY order failed: {:?}", sym, e),
                             }
