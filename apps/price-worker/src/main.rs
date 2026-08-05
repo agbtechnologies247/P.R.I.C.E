@@ -286,6 +286,287 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // 7. Delta Exchange 5-Minute Swing Trading Loop
+    //    - Runs continuously 24/7 (crypto never closes)
+    //    - Symbols: BTCUSD_PERP (200x), ETHUSD_PERP (200x), SOLUSD_PERP (100x)
+    //    - Position margin: 100 USDT per trade
+    //    - Signal: EMA-9 / EMA-21 crossover on 5m candles + momentum confirm
+    //    - Both LIVE (DeltaExchangeClient) and PAPER run simultaneously
+    // ──────────────────────────────────────────────────────────────────────────
+    {
+        let delta_key   = std::env::var("DELTA_API_KEY").ok();
+        let delta_sec   = std::env::var("DELTA_API_SECRET").ok();
+        let delta_url   = std::env::var("DELTA_BASE_URL")
+            .unwrap_or_else(|_| price_broker::DELTA_INDIA_PROD_URL.to_string());
+        let margin_usdt: f64 = std::env::var("DELTA_POSITION_MARGIN_USDT")
+            .unwrap_or_else(|_| "100.0".to_string())
+            .parse().unwrap_or(100.0);
+
+        // Symbols config: (symbol, max_leverage)
+        let delta_symbols: Vec<(&str, u32)> = vec![
+            ("BTCUSD_PERP", 200),
+            ("ETHUSD_PERP", 200),
+            ("SOLUSD_PERP", 100),
+        ];
+
+        if delta_key.is_some() {
+            let live_client = std::sync::Arc::new(price_broker::DeltaExchangeClient::new(
+                &delta_url,
+                delta_key.clone(),
+                delta_sec.clone(),
+            ));
+            // Paper client (no keys)
+            let paper_client = std::sync::Arc::new(price_broker::DeltaExchangeClient::new(
+                &delta_url, None, None,
+            ));
+
+            info!("[DeltaLoop] Starting 5m swing trading loop — symbols: BTCUSD_PERP, ETHUSD_PERP, SOLUSD_PERP");
+            info!("[DeltaLoop] Margin per trade: ${:.0} USDT | Both LIVE + PAPER running", margin_usdt);
+
+            // Heartbeat setup — create deadman switch on startup
+            {
+                let hb_client = live_client.clone();
+                tokio::spawn(async move {
+                    // 300s interval = 5 min. Our cron also acks every 5 min as backup.
+                    match hb_client.create_heartbeat(300).await {
+                        Ok(hb) => info!("[DeltaLoop] Deadman heartbeat created: id={} interval={}s", hb.id, hb.interval_secs),
+                        Err(e) => warn!("[DeltaLoop] Heartbeat creation failed (will retry): {:?}", e),
+                    }
+                    // Ack loop: every 240s (4 min) to stay within the 5-min window
+                    let mut ack_interval = time::interval(Duration::from_secs(240));
+                    loop {
+                        ack_interval.tick().await;
+                        if let Err(e) = hb_client.ack_heartbeat().await {
+                            warn!("[DeltaLoop] Heartbeat ACK failed: {:?}", e);
+                        }
+                    }
+                });
+            }
+
+            // Spawn one trading loop per symbol
+            for (symbol, max_lev) in delta_symbols {
+                let sym = symbol.to_string();
+                let lc  = live_client.clone();
+                let pc  = paper_client.clone();
+
+                tokio::spawn(async move {
+                    // Stagger symbol starts by a few seconds to avoid burst
+                    let stagger_secs = match sym.as_str() {
+                        "BTCUSD_PERP" => 0,
+                        "ETHUSD_PERP" => 10,
+                        _             => 20,
+                    };
+                    time::sleep(Duration::from_secs(stagger_secs)).await;
+
+                    info!("[DeltaLoop][{}] Starting 5m trading loop | leverage={}x | margin=${:.0}", sym, max_lev, margin_usdt);
+
+                    // Set leverage on startup
+                    let prod_id = lc.resolve_product_id(&sym).await;
+                    if let Err(e) = lc.set_leverage(prod_id, max_lev).await {
+                        warn!("[DeltaLoop][{}] Could not set leverage to {}x: {:?}", sym, max_lev, e);
+                    } else {
+                        info!("[DeltaLoop][{}] Leverage set to {}x (product_id={})", sym, max_lev, prod_id);
+                    }
+
+                    // Wait for the next 5-minute boundary so all symbols are in sync
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                    let secs_until_next_5m = 300 - (now_secs % 300);
+                    info!("[DeltaLoop][{}] Syncing to 5m boundary — waiting {}s", sym, secs_until_next_5m);
+                    time::sleep(Duration::from_secs(secs_until_next_5m)).await;
+
+                    let mut loop_interval = time::interval(Duration::from_secs(300)); // 5 minutes
+                    let mut candle_buffer: Vec<price_broker::Candle5m> = Vec::new();
+
+                    loop {
+                        loop_interval.tick().await;
+                        let now = chrono::Utc::now();
+                        info!("[DeltaLoop][{}] === 5m tick at {} ===", sym, now.format("%H:%M:%S"));
+
+                        // ── 1. Fetch latest 20 candles ────────────────────────
+                        let candles = match lc.get_historical_candles_5m(&sym, 20).await {
+                            Ok(c) if c.len() >= 10 => c,
+                            Ok(c) => {
+                                warn!("[DeltaLoop][{}] Not enough candles ({}/10), skipping", sym, c.len());
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!("[DeltaLoop][{}] Failed to fetch candles: {:?}", sym, e);
+                                continue;
+                            }
+                        };
+
+                        // Append new candles to rolling buffer (keep last 50)
+                        candle_buffer.extend_from_slice(&candles);
+                        if candle_buffer.len() > 50 {
+                            candle_buffer.drain(..candle_buffer.len() - 50);
+                        }
+
+                        let n = candle_buffer.len();
+                        let closes: Vec<f64> = candle_buffer.iter().map(|c| c.close).collect();
+                        let current_price = *closes.last().unwrap();
+
+                        // ── 2. Compute EMA-9 and EMA-21 ──────────────────────
+                        fn ema(prices: &[f64], period: usize) -> f64 {
+                            if prices.len() < period { return *prices.last().unwrap_or(&0.0); }
+                            let k = 2.0 / (period as f64 + 1.0);
+                            let mut ema_val = prices[..period].iter().sum::<f64>() / period as f64;
+                            for &p in &prices[period..] {
+                                ema_val = p * k + ema_val * (1.0 - k);
+                            }
+                            ema_val
+                        }
+
+                        let ema9_now  = ema(&closes, 9);
+                        let ema21_now = ema(&closes, 21);
+                        // Previous bar EMAs for crossover detection
+                        let ema9_prev  = if n > 2 { ema(&closes[..n-1], 9)  } else { ema9_now };
+                        let ema21_prev = if n > 2 { ema(&closes[..n-1], 21) } else { ema21_now };
+
+                        let bullish_cross = ema9_prev <= ema21_prev && ema9_now > ema21_now;
+                        let bearish_cross = ema9_prev >= ema21_prev && ema9_now < ema21_now;
+                        let trend_up   = ema9_now > ema21_now;
+                        let trend_down = ema9_now < ema21_now;
+
+                        // Momentum: last candle bullish/bearish
+                        let last_candle = candle_buffer.last().unwrap();
+                        let momentum_bull = last_candle.close > last_candle.open;
+                        let momentum_bear = last_candle.close < last_candle.open;
+
+                        // ATR-based stop-loss (14-period, simplified)
+                        let atr: f64 = if n >= 14 {
+                            candle_buffer[n-14..].windows(2).map(|w| {
+                                let tr = (w[1].high - w[1].low)
+                                    .max((w[1].high - w[0].close).abs())
+                                    .max((w[1].low  - w[0].close).abs());
+                                tr
+                            }).sum::<f64>() / 13.0
+                        } else {
+                            current_price * 0.002 // Fallback: 0.2% ATR
+                        };
+                        // SL = 1.5x ATR away; TP = 2x ATR away
+                        let sl_dist = atr * 1.5;
+                        let tp_dist = atr * 2.0;
+
+                        info!("[DeltaLoop][{}] Price={:.2} EMA9={:.2} EMA21={:.2} ATR={:.2} | Bull={} Bear={}",
+                            sym, current_price, ema9_now, ema21_now, atr, bullish_cross, bearish_cross);
+
+                        // ── 3. Check existing open position (LIVE) ──────────
+                        let live_position = match lc.get_current_position_for_symbol(&sym).await {
+                            Ok(pos) => pos,
+                            Err(e) => { warn!("[DeltaLoop][{}] Position query failed: {:?}", sym, e); None }
+                        };
+
+                        // ── 4. EXIT LOGIC — close if signal reverses ─────────
+                        if let Some((size, ref open_side, entry_price)) = live_position {
+                            let should_exit = match open_side {
+                                price_broker::Side::Buy  => trend_down || bearish_cross,
+                                price_broker::Side::Sell => trend_up   || bullish_cross,
+                            };
+                            if should_exit {
+                                info!("[DeltaLoop][{}] EXIT signal — closing {:?} {}contracts @ {:.2} (entry={:.2})",
+                                    sym, open_side, size, current_price, entry_price);
+                                let close_side = match open_side {
+                                    price_broker::Side::Buy  => price_broker::Side::Sell,
+                                    price_broker::Side::Sell => price_broker::Side::Buy,
+                                };
+                                // Calculate number of contracts based on margin
+                                let contracts = ((margin_usdt * max_lev as f64) / current_price).max(1.0) as i32;
+                                let close_req = price_broker::OrderRequest {
+                                    symbol: sym.clone(),
+                                    qty: contracts,
+                                    side: close_side,
+                                    order_type: price_broker::OrderType::Market,
+                                    limit_price: None,
+                                    stop_price: None,
+                                    product_type: None,
+                                    validity: None,
+                                    disclosed_qty: None,
+                                    offline_order: None,
+                                };
+                                match lc.place_order(&close_req).await {
+                                    Ok(resp) => info!("[DeltaLoop][{}] LIVE EXIT order placed: {}", sym, resp.order_id),
+                                    Err(e)   => warn!("[DeltaLoop][{}] LIVE EXIT order failed: {:?}", sym, e),
+                                }
+                            } else {
+                                info!("[DeltaLoop][{}] Holding {:?} position | size={} entry={:.2}", sym, open_side, size, entry_price);
+                            }
+                            continue; // Don't enter a new position while one is open
+                        }
+
+                        // ── 5. ENTRY LOGIC — place bracket order ─────────────
+                        let signal = if (bullish_cross || trend_up) && momentum_bull {
+                            Some(price_broker::Side::Buy)
+                        } else if (bearish_cross || trend_down) && momentum_bear {
+                            Some(price_broker::Side::Sell)
+                        } else {
+                            None
+                        };
+
+                        if let Some(entry_side) = signal {
+                            let (sl_price, tp_price) = match entry_side {
+                                price_broker::Side::Buy => (
+                                    (current_price - sl_dist).max(0.01),
+                                    current_price + tp_dist,
+                                ),
+                                price_broker::Side::Sell => (
+                                    current_price + sl_dist,
+                                    (current_price - tp_dist).max(0.01),
+                                ),
+                            };
+                            // Contracts = (margin_usdt * leverage) / price
+                            let contracts = ((margin_usdt * max_lev as f64) / current_price).max(1.0) as i32;
+
+                            let bracket_req = price_broker::BracketOrderRequest {
+                                product_id: prod_id,
+                                side: entry_side.clone(),
+                                size: contracts,
+                                order_type: price_broker::OrderType::Market,
+                                limit_price: None,
+                                stop_price: None,
+                                stop_loss_price: sl_price,
+                                take_profit_price: tp_price,
+                                trail_amount: None,
+                            };
+
+                            info!("[DeltaLoop][{}] ENTRY {:?} {} contracts @ ~{:.2} | SL={:.2} TP={:.2}",
+                                sym, entry_side, contracts, current_price, sl_price, tp_price);
+
+                            // Place LIVE bracket order
+                            match lc.place_bracket_order(&bracket_req).await {
+                                Ok(resp) => info!("[DeltaLoop][{}] LIVE ENTRY order placed: {}", sym, resp.order_id),
+                                Err(e)   => warn!("[DeltaLoop][{}] LIVE ENTRY order failed: {:?}", sym, e),
+                            }
+
+                            // Mirror as PAPER trade (no real keys)
+                            let paper_req = price_broker::OrderRequest {
+                                symbol: sym.clone(),
+                                qty: contracts,
+                                side: entry_side,
+                                order_type: price_broker::OrderType::Market,
+                                limit_price: None,
+                                stop_price: None,
+                                product_type: None,
+                                validity: None,
+                                disclosed_qty: None,
+                                offline_order: None,
+                            };
+                            match pc.place_order(&paper_req).await {
+                                Ok(resp) => info!("[DeltaLoop][{}] PAPER ENTRY order placed: {}", sym, resp.order_id),
+                                Err(e)   => warn!("[DeltaLoop][{}] PAPER ENTRY order failed: {:?}", sym, e),
+                            }
+                        } else {
+                            info!("[DeltaLoop][{}] No signal this 5m bar — waiting", sym);
+                        }
+                    } // end loop
+                }); // end tokio::spawn per symbol
+            }
+        } else {
+            warn!("[DeltaLoop] DELTA_API_KEY not set — Delta trading loop disabled");
+        }
+    }
+
     // Active Option symbols tracking (strike-based)
     let mut last_subscribed_strike: Option<f64> = None;
 

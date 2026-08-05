@@ -12,6 +12,18 @@ use tracing::{info, warn, debug};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// A 5-minute OHLC candle from Delta Exchange historical data.
+#[derive(Debug, Clone)]
+pub struct Candle5m {
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    /// Unix timestamp (seconds) of candle open
+    pub timestamp: i64,
+}
+
 /// Delta Exchange India Production REST Base URL
 pub const DELTA_INDIA_PROD_URL: &str = "https://api.india.delta.exchange";
 /// Delta Exchange Global Production REST Base URL
@@ -1251,6 +1263,73 @@ impl DeltaExchangeClient {
         } else {
             Err(PriceError::BrokerError("Failed to set position auto topup".to_string()))
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  5-MINUTE CANDLES & POSITION QUERY (Delta 5m Trading Loop)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Fetches the last `limit` 5-minute OHLC candles for a symbol.
+    /// Endpoint: GET /v2/history/candles?resolution=5m&symbol=BTCUSD_PERP&limit=N
+    /// Returns candles in chronological order (oldest first).
+    pub async fn get_historical_candles_5m(&self, symbol: &str, limit: u32) -> Result<Vec<Candle5m>> {
+        let path = "/v2/history/candles";
+        let query = format!("?resolution=5m&symbol={}&limit={}", symbol, limit);
+        let url = format!("{}{}{}", self.base_url, path, query);
+        let res = self.client.get(&url).send().await
+            .map_err(|e| PriceError::Network(e.to_string()))?;
+        let body = self.parse_response(res).await?;
+        if body["success"].as_bool().unwrap_or(false) {
+            let mut candles = Vec::new();
+            if let Some(arr) = body["result"].as_array() {
+                for c in arr {
+                    let open:   f64 = c["open"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    let high:   f64 = c["high"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    let low:    f64 = c["low"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    let close:  f64 = c["close"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    let volume: f64 = c["volume"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                    let ts:     i64 = c["time"].as_i64().unwrap_or(0);
+                    if close > 0.0 {
+                        candles.push(Candle5m { open, high, low, close, volume, timestamp: ts });
+                    }
+                }
+            }
+            // Delta returns newest-first — reverse to chronological order
+            candles.reverse();
+            Ok(candles)
+        } else {
+            Err(PriceError::BrokerError(format!(
+                "Failed to fetch 5m candles for {}: {:?}", symbol, body.get("error")
+            )))
+        }
+    }
+
+    /// Returns the open margined position for a symbol, or None if flat.
+    /// Returns Some((size, side, entry_price)) where size > 0 always.
+    pub async fn get_current_position_for_symbol(&self, symbol: &str) -> Result<Option<(f64, Side, f64)>> {
+        if self.api_key.is_none() { return Ok(None); }
+        let path = "/v2/positions/margined";
+        let query = format!("?product_symbol={}", symbol);
+        let url = format!("{}{}{}", self.base_url, path, query);
+        let req = self.client.get(&url);
+        let req = self.add_auth_headers(req, "GET", path, &query, "");
+        let res = req.send().await.map_err(|e| PriceError::Network(e.to_string()))?;
+        let body = self.parse_response(res).await?;
+        if body["success"].as_bool().unwrap_or(false) {
+            if let Some(arr) = body["result"].as_array() {
+                for p in arr {
+                    let size: f64 = p["size"].as_f64()
+                        .or_else(|| p["size"].as_str().and_then(|s| s.parse().ok()))
+                        .unwrap_or(0.0);
+                    if size.abs() > 0.0 {
+                        let entry: f64 = p["entry_price"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
+                        let side = if size > 0.0 { Side::Buy } else { Side::Sell };
+                        return Ok(Some((size.abs(), side, entry)));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
