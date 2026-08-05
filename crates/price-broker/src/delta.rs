@@ -141,9 +141,10 @@ impl DeltaExchangeClient {
     /// Resolves the Delta Exchange product_id from a symbol name using the cached instrument list.
     /// Falls back to 27 (BTCUSD Perpetual) if not found.
     pub async fn resolve_product_id(&self, symbol: &str) -> i64 {
+        let sym_upper = symbol.to_uppercase();
         // Try the cache first
         if let Ok(cache) = self.instrument_cache.read() {
-            if let Some(meta) = cache.get(symbol) {
+            if let Some(meta) = cache.get(symbol).or_else(|| cache.get(&sym_upper)) {
                 return meta.product_id;
             }
         }
@@ -152,17 +153,28 @@ impl DeltaExchangeClient {
             if let Ok(mut cache) = self.instrument_cache.write() {
                 for inst in &instruments {
                     cache.insert(inst.symbol.clone(), inst.clone());
+                    cache.insert(inst.symbol.to_uppercase(), inst.clone());
                 }
             }
             // Search again after cache update
             if let Ok(cache) = self.instrument_cache.read() {
-                if let Some(meta) = cache.get(symbol) {
+                if let Some(meta) = cache.get(symbol).or_else(|| cache.get(&sym_upper)) {
                     return meta.product_id;
                 }
             }
         }
-        warn!("Could not resolve product_id for symbol '{}'. Using fallback 27 (BTCUSD_PERP).", symbol);
-        27 // Default fallback: BTCUSD Perpetual product_id on Delta Exchange
+        // Default product_id fallbacks for Delta Exchange perpetuals
+        let fallback = if sym_upper.contains("BTC") {
+            27 // BTCUSD_PERP
+        } else if sym_upper.contains("ETH") {
+            28 // ETHUSD_PERP
+        } else if sym_upper.contains("SOL") {
+            352 // SOLUSD_PERP
+        } else {
+            27
+        };
+        warn!("Could not resolve product_id for symbol '{}'. Using fallback {}.", symbol, fallback);
+        fallback
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1273,8 +1285,10 @@ impl DeltaExchangeClient {
     /// Endpoint: GET /v2/history/candles?resolution=5m&symbol=BTCUSD_PERP&limit=N
     /// Returns candles in chronological order (oldest first).
     pub async fn get_historical_candles_5m(&self, symbol: &str, limit: u32) -> Result<Vec<Candle5m>> {
+        let end_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let start_ts = end_ts - (limit as i64 * 300);
         let path = "/v2/history/candles";
-        let query = format!("?resolution=5m&symbol={}&limit={}", symbol, limit);
+        let query = format!("?resolution=5m&symbol={}&start={}&end={}", symbol, start_ts, end_ts);
         let url = format!("{}{}{}", self.base_url, path, query);
         let res = self.client.get(&url).send().await
             .map_err(|e| PriceError::Network(e.to_string()))?;
