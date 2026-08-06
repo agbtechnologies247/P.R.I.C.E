@@ -47,6 +47,7 @@ impl DeltaExchangeClient {
         headers.insert("Content-Type", reqwest::header::HeaderValue::from_static("application/json"));
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -1418,11 +1419,18 @@ impl Broker for DeltaExchangeClient {
         if body["success"].as_bool().unwrap_or(false) {
             let mut available = 0.0;
             let mut utilised = 0.0;
+            let parse_val = |v: &serde_json::Value| -> f64 {
+                v.as_f64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    .or_else(|| v.as_i64().map(|i| i as f64))
+                    .unwrap_or(0.0)
+            };
+
             if let Some(arr) = body["result"].as_array() {
                 for item in arr {
-                    let balance: f64 = item["available_balance"].as_str().unwrap_or("0.0").parse().unwrap_or(0.0);
-                    let order_margin: f64 = item["order_margin"].as_str().unwrap_or("0.0").parse().unwrap_or(0.0);
-                    let position_margin: f64 = item["position_margin"].as_str().unwrap_or("0.0").parse().unwrap_or(0.0);
+                    let balance = parse_val(&item["available_balance"]);
+                    let order_margin = parse_val(&item["order_margin"]);
+                    let position_margin = parse_val(&item["position_margin"]);
                     available += balance;
                     utilised += order_margin + position_margin;
                 }
