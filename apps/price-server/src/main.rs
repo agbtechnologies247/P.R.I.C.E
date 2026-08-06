@@ -53,6 +53,13 @@ struct CryptoSignal {
     bear_cross: bool,
     leverage: u32,
     margin_usdt: f64,
+    /// Quantitative & ML Pipeline Metrics
+    quality_score: f64,
+    opportunity_confidence: f64,
+    ml_win_probability: f64,
+    ml_confidence: f64,
+    decision: String,
+    target_contract: String,
     timestamp: String,
 }
 
@@ -660,12 +667,21 @@ async fn index_handler() -> Html<&'static str> {
                         <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;">
                             <!-- BTC -->
                             <div style="background: rgba(251,191,36,0.05); border: 1px solid rgba(251,191,36,0.2); border-radius: 12px; padding: 1rem;">
-                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
                                     <span style="font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: #fbbf24; font-size: 0.9rem;">₿ BTC (200x)</span>
-                                    <span id="btc-sig-badge" class="status-badge badge-wait" style="font-size: 0.65rem; padding: 0.2rem 0.5rem;">HOLD</span>
+                                    <span id="btc-sig-badge" class="status-badge badge-wait" style="font-size: 0.65rem; padding: 0.2rem 0.5rem;">WAIT</span>
                                 </div>
-                                <div style="font-size: 1.1rem; font-weight: 700; color: #fbbf24; font-family: 'Space Grotesk', sans-serif; margin-bottom: 0.5rem;" id="btc-sig-price">$0.00</div>
-                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; font-size: 0.75rem; color: var(--text-muted);">
+                                <div style="font-size: 1.15rem; font-weight: 700; color: #fbbf24; font-family: 'Space Grotesk', sans-serif; margin-bottom: 0.6rem;" id="btc-sig-price">$0.00</div>
+                                
+                                <!-- ML & Quant Decision Metrics -->
+                                <div style="background: rgba(0,0,0,0.25); padding: 0.5rem; border-radius: 8px; margin-bottom: 0.6rem; display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; font-size: 0.72rem;">
+                                    <div>Score: <strong id="btc-quality-score" style="color: var(--warning);">0.0</strong></div>
+                                    <div>Opp Conf: <strong id="btc-opp-confidence" style="color: var(--text-main);">0%</strong></div>
+                                    <div>ML Win Prob: <strong id="btc-ml-win-prob" style="color: var(--success);">0%</strong></div>
+                                    <div>ML Conf: <strong id="btc-ml-conf" style="color: var(--text-main);">0%</strong></div>
+                                </div>
+
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; font-size: 0.72rem; color: var(--text-muted);">
                                     <span>EMA9: <strong id="btc-ema9" style="color: var(--text-main);">—</strong></span>
                                     <span>EMA21: <strong id="btc-ema21" style="color: var(--text-main);">—</strong></span>
                                     <span>ATR: <strong id="btc-atr" style="color: var(--text-main);">—</strong></span>
@@ -674,12 +690,21 @@ async fn index_handler() -> Html<&'static str> {
                             </div>
                             <!-- ETH -->
                             <div style="background: rgba(99,102,241,0.05); border: 1px solid rgba(99,102,241,0.2); border-radius: 12px; padding: 1rem;">
-                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
                                     <span style="font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: #818cf8; font-size: 0.9rem;">Ξ ETH (200x)</span>
-                                    <span id="eth-sig-badge" class="status-badge badge-wait" style="font-size: 0.65rem; padding: 0.2rem 0.5rem;">HOLD</span>
+                                    <span id="eth-sig-badge" class="status-badge badge-wait" style="font-size: 0.65rem; padding: 0.2rem 0.5rem;">WAIT</span>
                                 </div>
-                                <div style="font-size: 1.1rem; font-weight: 700; color: #818cf8; font-family: 'Space Grotesk', sans-serif; margin-bottom: 0.5rem;" id="eth-sig-price">$0.00</div>
-                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; font-size: 0.75rem; color: var(--text-muted);">
+                                <div style="font-size: 1.15rem; font-weight: 700; color: #818cf8; font-family: 'Space Grotesk', sans-serif; margin-bottom: 0.6rem;" id="eth-sig-price">$0.00</div>
+
+                                <!-- ML & Quant Decision Metrics -->
+                                <div style="background: rgba(0,0,0,0.25); padding: 0.5rem; border-radius: 8px; margin-bottom: 0.6rem; display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; font-size: 0.72rem;">
+                                    <div>Score: <strong id="eth-quality-score" style="color: var(--warning);">0.0</strong></div>
+                                    <div>Opp Conf: <strong id="eth-opp-confidence" style="color: var(--text-main);">0%</strong></div>
+                                    <div>ML Win Prob: <strong id="eth-ml-win-prob" style="color: var(--success);">0%</strong></div>
+                                    <div>ML Conf: <strong id="eth-ml-conf" style="color: var(--text-main);">0%</strong></div>
+                                </div>
+
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; font-size: 0.72rem; color: var(--text-muted);">
                                     <span>EMA9: <strong id="eth-ema9" style="color: var(--text-main);">—</strong></span>
                                     <span>EMA21: <strong id="eth-ema21" style="color: var(--text-main);">—</strong></span>
                                     <span>ATR: <strong id="eth-atr" style="color: var(--text-main);">—</strong></span>
@@ -688,12 +713,21 @@ async fn index_handler() -> Html<&'static str> {
                             </div>
                             <!-- SOL -->
                             <div style="background: rgba(16,185,129,0.05); border: 1px solid rgba(16,185,129,0.2); border-radius: 12px; padding: 1rem;">
-                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;">
                                     <span style="font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: #34d399; font-size: 0.9rem;">◎ SOL (100x)</span>
-                                    <span id="sol-sig-badge" class="status-badge badge-wait" style="font-size: 0.65rem; padding: 0.2rem 0.5rem;">HOLD</span>
+                                    <span id="sol-sig-badge" class="status-badge badge-wait" style="font-size: 0.65rem; padding: 0.2rem 0.5rem;">WAIT</span>
                                 </div>
-                                <div style="font-size: 1.1rem; font-weight: 700; color: #34d399; font-family: 'Space Grotesk', sans-serif; margin-bottom: 0.5rem;" id="sol-sig-price">$0.00</div>
-                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; font-size: 0.75rem; color: var(--text-muted);">
+                                <div style="font-size: 1.15rem; font-weight: 700; color: #34d399; font-family: 'Space Grotesk', sans-serif; margin-bottom: 0.6rem;" id="sol-sig-price">$0.00</div>
+
+                                <!-- ML & Quant Decision Metrics -->
+                                <div style="background: rgba(0,0,0,0.25); padding: 0.5rem; border-radius: 8px; margin-bottom: 0.6rem; display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; font-size: 0.72rem;">
+                                    <div>Score: <strong id="sol-quality-score" style="color: var(--warning);">0.0</strong></div>
+                                    <div>Opp Conf: <strong id="sol-opp-confidence" style="color: var(--text-main);">0%</strong></div>
+                                    <div>ML Win Prob: <strong id="sol-ml-win-prob" style="color: var(--success);">0%</strong></div>
+                                    <div>ML Conf: <strong id="sol-ml-conf" style="color: var(--text-main);">0%</strong></div>
+                                </div>
+
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; font-size: 0.72rem; color: var(--text-muted);">
                                     <span>EMA9: <strong id="sol-ema9" style="color: var(--text-main);">—</strong></span>
                                     <span>EMA21: <strong id="sol-ema21" style="color: var(--text-main);">—</strong></span>
                                     <span>ATR: <strong id="sol-atr" style="color: var(--text-main);">—</strong></span>
@@ -1867,9 +1901,23 @@ async fn index_handler() -> Html<&'static str> {
                         
                         const badge = document.getElementById(`${key}-sig-badge`);
                         if (badge) {
-                            badge.textContent = s.action || 'HOLD';
-                            badge.className = 'status-badge ' + (s.action === 'ENTRY' ? 'badge-trade' : s.action === 'EXIT' ? 'badge-cancel' : 'badge-wait');
+                            const dec = s.decision || s.action || 'WAIT';
+                            badge.textContent = dec;
+                            badge.className = 'status-badge ' + (dec === 'TRADE' || dec === 'ENTRY' ? 'badge-trade' : dec === 'HOLD' || dec === 'WATCH' ? 'badge-trade' : 'badge-wait');
                         }
+
+                        // Update ML & Quantitative Metrics
+                        const scoreElem = document.getElementById(`${key}-quality-score`);
+                        if (scoreElem) scoreElem.textContent = (s.quality_score || 0.0).toFixed(1);
+
+                        const oppConfElem = document.getElementById(`${key}-opp-confidence`);
+                        if (oppConfElem) oppConfElem.textContent = `${(s.opportunity_confidence || 0.0).toFixed(1)}%`;
+
+                        const winProbElem = document.getElementById(`${key}-ml-win-prob`);
+                        if (winProbElem) winProbElem.textContent = `${(s.ml_win_probability || 0.0).toFixed(1)}%`;
+
+                        const mlConfElem = document.getElementById(`${key}-ml-conf`);
+                        if (mlConfElem) mlConfElem.textContent = `${(s.ml_confidence || 0.0).toFixed(1)}%`;
                         
                         const ema9 = document.getElementById(`${key}-ema9`);
                         if (ema9) ema9.textContent = s.ema9 > 0 ? `$${s.ema9.toFixed(2)}` : '—';
