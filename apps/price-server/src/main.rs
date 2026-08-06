@@ -247,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/database/download-status", get(download_status_handler))
         .route("/database/start-download", post(start_download_handler))
         .route("/database/download", get(download_handler))
+        .route("/database/export-csv", get(export_csv_handler))
         .route("/database/symbol-mappings", get(symbol_mappings_handler))
         .route("/journals/trade", get(journals_trade_handler))
         .route("/journals/decision", get(journals_decision_handler))
@@ -967,6 +968,7 @@ async fn index_handler() -> Html<&'static str> {
                         </div>
                     </div>
                     <button id="downloader-action-btn" class="btn" style="width: 100%;">Start Data Collection</button>
+                    <button id="downloader-export-csv-btn" class="btn" style="width: 100%; margin-top: 0.5rem; background: #059669;" onclick="exportCsvData()">📥 Export CSV (Collected Data)</button>
                 </div>
             </div>
 
@@ -1510,11 +1512,9 @@ async fn index_handler() -> Html<&'static str> {
                         statusVal.textContent = 'COMPLETED';
                         statusVal.style.color = 'var(--success)';
                         timeRow.style.display = 'none';
-                        actionBtn.textContent = 'Download Data (Excel)';
+                        actionBtn.textContent = 'Data Downloaded (Restart / Download)';
                         actionBtn.disabled = false;
-                        actionBtn.onclick = () => {
-                            window.location.href = `/database/download?year=${year}&symbol=${encodeURIComponent(symbol)}`;
-                        };
+                        actionBtn.onclick = startDataCollection;
                         if (statusPollInterval) {
                             clearInterval(statusPollInterval);
                             statusPollInterval = null;
@@ -1530,6 +1530,18 @@ async fn index_handler() -> Html<&'static str> {
                         
                         if (!statusPollInterval) {
                             statusPollInterval = setInterval(checkDownloadStatus, 2000);
+                        }
+                    } else if (ds.includes('FAILED') || ds === 'FAILED') {
+                        statusVal.textContent = 'FAILED (Retry Available)';
+                        statusVal.style.color = 'var(--danger)';
+                        timeRow.style.display = 'flex';
+                        timeVal.textContent = data.time_remaining;
+                        actionBtn.textContent = 'Start Data Collection (Retry)';
+                        actionBtn.disabled = false;
+                        actionBtn.onclick = startDataCollection;
+                        if (statusPollInterval) {
+                            clearInterval(statusPollInterval);
+                            statusPollInterval = null;
                         }
                     } else {
                         statusVal.textContent = 'NOT_STARTED';
@@ -1574,6 +1586,13 @@ async fn index_handler() -> Html<&'static str> {
                 console.error("Error starting collection", e);
                 checkDownloadStatus();
             }
+        }
+
+        function exportCsvData() {
+            const symbol = symbolSelect.value;
+            const year = yearSelect.value;
+            if (!symbol) return;
+            window.location.href = `/database/export-csv?symbol=${encodeURIComponent(symbol)}&year=${year}`;
         }
 
         async function fetchLiveStatus() {
@@ -2506,63 +2525,144 @@ fn format_time_remaining(seconds: i64) -> String {
 
 async fn start_background_downloader(db: TimescaleClient, python_broker_url: String) {
     tokio::spawn(async move {
-        info!("Starting background historical data downloader thread...");
-        let downloader = price_backtester::HistoricalDownloader::new(&python_broker_url, db.clone());
+        info!("Starting parallel background historical data downloader thread...");
+        let downloader = Arc::new(price_backtester::HistoricalDownloader::new(&python_broker_url, db.clone()));
+        
         loop {
-            // Query for the next PENDING or FAILED job
-            let next_job = sqlx::query(
-                "SELECT symbol, from_date, to_date 
-                 FROM download_jobs 
-                 WHERE status = 'PENDING'
-                 ORDER BY last_updated ASC
-                 LIMIT 1"
+            // 1. Auto-reset jobs stuck in IN_PROGRESS for > 3 minutes back to PENDING
+            let _ = sqlx::query(
+                "UPDATE download_jobs 
+                 SET status = 'PENDING', last_updated = NOW() 
+                 WHERE status = 'IN_PROGRESS' 
+                   AND last_updated < NOW() - INTERVAL '3 minutes'"
             )
-            .fetch_optional(&db.pool)
+            .execute(&db.pool)
             .await;
 
-            match next_job {
-                Ok(Some(row)) => {
-                    let symbol: String = row.get("symbol");
-                    let from_date: chrono::NaiveDate = row.get("from_date");
-                    let to_date: chrono::NaiveDate = row.get("to_date");
-                    // Resolve exchange from symbol mapping if available
-                    let exchange = if let Ok(Some(m)) = db.get_symbol_mapping(&symbol).await {
-                        m.exchange
-                    } else {
-                        "NSE".to_string()
-                    };
+            // 2. Fetch all distinct symbols with PENDING jobs
+            let pending_symbols = sqlx::query(
+                "SELECT DISTINCT symbol 
+                 FROM download_jobs 
+                 WHERE status = 'PENDING'"
+            )
+            .fetch_all(&db.pool)
+            .await;
 
-                    info!("Background downloader executing job for {} (exchange {}) from {} to {}", symbol, exchange, from_date, to_date);
-                    
-                    // Mark as IN_PROGRESS
-                    let _ = db.mark_job_status(&symbol, from_date, to_date, "IN_PROGRESS").await;
+            if let Ok(rows) = pending_symbols {
+                if !rows.is_empty() {
+                    for r in rows {
+                        let sym: String = r.get("symbol");
+                        let db_clone = db.clone();
+                        let downloader_clone = downloader.clone();
 
-                    // Download history
-                    match downloader.download_history(&symbol, &exchange, from_date, to_date).await {
-                        Ok(_) => {
-                            info!("Successfully finished background download job for {} from {} to {}", symbol, from_date, to_date);
-                            let _ = db.mark_job_status(&symbol, from_date, to_date, "COMPLETED").await;
-                        }
-                        Err(e) => {
-                            error!("Background downloader job failed for {} from {} to {}: {:?}", symbol, from_date, to_date, e);
-                            let _ = db.mark_job_status(&symbol, from_date, to_date, &format!("FAILED: {}", e)).await;
-                        }
+                        tokio::spawn(async move {
+                            // Process PENDING job for this symbol
+                            let job = sqlx::query(
+                                "SELECT symbol, from_date, to_date 
+                                 FROM download_jobs 
+                                 WHERE symbol = $1 AND status = 'PENDING'
+                                 ORDER BY last_updated ASC
+                                 LIMIT 1"
+                            )
+                            .bind(&sym)
+                            .fetch_optional(&db_clone.pool)
+                            .await;
+
+                            if let Ok(Some(row)) = job {
+                                let symbol: String = row.get("symbol");
+                                let from_date: chrono::NaiveDate = row.get("from_date");
+                                let to_date: chrono::NaiveDate = row.get("to_date");
+
+                                let exchange = if let Ok(Some(m)) = db_clone.get_symbol_mapping(&symbol).await {
+                                    m.exchange
+                                } else if symbol.contains("PERP") || symbol.starts_with("BTC") || symbol.starts_with("ETH") || symbol.starts_with("SOL") {
+                                    "DELTA".to_string()
+                                } else {
+                                    "NSE".to_string()
+                                };
+
+                                tracing::info!("Parallel downloader running job for {} ({}) from {} to {}", symbol, exchange, from_date, to_date);
+                                let _ = db_clone.mark_job_status(&symbol, from_date, to_date, "IN_PROGRESS").await;
+
+                                match downloader_clone.download_history(&symbol, &exchange, from_date, to_date).await {
+                                    Ok(_) => {
+                                        tracing::info!("Parallel downloader COMPLETED job for {} from {} to {}", symbol, from_date, to_date);
+                                        let _ = db_clone.mark_job_status(&symbol, from_date, to_date, "COMPLETED").await;
+                                    }
+                                    Err(e) => {
+                                        let err_str = e.to_string();
+                                        tracing::error!("Parallel downloader job FAILED for {} from {} to {}: {}", symbol, from_date, to_date, err_str);
+                                        let _ = db_clone.mark_job_status(&symbol, from_date, to_date, &format!("FAILED: {}", err_str)).await;
+                                    }
+                                }
+                            }
+                        });
                     }
-                    
-                    // Sleep for 5 seconds to comply with rate limits (1 request every 5 seconds)
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                }
-                Ok(None) => {
-                    // No pending jobs, wait before querying again
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                }
-                Err(e) => {
-                    error!("Database error in background downloader loop: {:?}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 }
             }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     });
+}
+
+#[derive(serde::Deserialize)]
+struct ExportCsvParams {
+    symbol: String,
+    year: Option<i32>,
+}
+
+async fn export_csv_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<ExportCsvParams>,
+) -> impl IntoResponse {
+    let canonical = if let Ok(Some(mapping)) = state.db.get_symbol_mapping(&params.symbol).await {
+        mapping.canonical_symbol
+    } else {
+        params.symbol.clone()
+    };
+
+    let sql = if let Some(year) = params.year {
+        "SELECT bucket as timestamp, open, high, low, close, volume 
+         FROM candles 
+         WHERE symbol = $1 AND EXTRACT(YEAR FROM bucket)::integer = $2 
+         ORDER BY bucket ASC".to_string()
+    } else {
+        "SELECT bucket as timestamp, open, high, low, close, volume 
+         FROM candles 
+         WHERE symbol = $1 
+         ORDER BY bucket ASC".to_string()
+    };
+
+    let rows = if let Some(year) = params.year {
+        sqlx::query(&sql).bind(&canonical).bind(year).fetch_all(&state.db.pool).await
+    } else {
+        sqlx::query(&sql).bind(&canonical).fetch_all(&state.db.pool).await
+    };
+
+    let mut csv_out = String::from("timestamp,open,high,low,close,volume\n");
+    if let Ok(rows) = rows {
+        for r in rows {
+            let ts: chrono::DateTime<chrono::Utc> = r.get("timestamp");
+            let open: f64 = r.get("open");
+            let high: f64 = r.get("high");
+            let low: f64 = r.get("low");
+            let close: f64 = r.get("close");
+            let volume: i64 = r.get("volume");
+            csv_out.push_str(&format!(
+                "{},{:.4},{:.4},{:.4},{:.4},{}\n",
+                ts.to_rfc3339(), open, high, low, close, volume
+            ));
+        }
+    }
+
+    let filename = format!("{}_candles.csv", canonical.replace(':', "_"));
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("text/csv"));
+    if let Ok(disposition) = axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", filename)) {
+        headers.insert(axum::http::header::CONTENT_DISPOSITION, disposition);
+    }
+    (headers, csv_out)
 }
 
 async fn symbol_mappings_handler(

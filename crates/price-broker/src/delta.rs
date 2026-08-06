@@ -1296,14 +1296,24 @@ impl DeltaExchangeClient {
         let body = self.parse_response(res).await?;
         if body["success"].as_bool().unwrap_or(false) {
             let mut candles = Vec::new();
+            let parse_num = |v: &serde_json::Value| -> f64 {
+                v.as_f64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    .or_else(|| v.as_i64().map(|i| i as f64))
+                    .unwrap_or(0.0)
+            };
+
             if let Some(arr) = body["result"].as_array() {
                 for c in arr {
-                    let open:   f64 = c["open"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
-                    let high:   f64 = c["high"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
-                    let low:    f64 = c["low"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
-                    let close:  f64 = c["close"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
-                    let volume: f64 = c["volume"].as_str().unwrap_or("0").parse().unwrap_or(0.0);
-                    let ts:     i64 = c["time"].as_i64().unwrap_or(0);
+                    let open:   f64 = parse_num(&c["open"]);
+                    let high:   f64 = parse_num(&c["high"]);
+                    let low:    f64 = parse_num(&c["low"]);
+                    let close:  f64 = parse_num(&c["close"]);
+                    let volume: f64 = parse_num(&c["volume"]);
+                    let ts:     i64 = c["time"].as_i64()
+                        .or_else(|| c["time"].as_str().and_then(|s| s.parse().ok()))
+                        .unwrap_or(0);
+
                     if close > 0.0 {
                         candles.push(Candle5m { open, high, low, close, volume, timestamp: ts });
                     }
