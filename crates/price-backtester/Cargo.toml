@@ -22,3 +22,5 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+hmac = "0.13.0"
+sha2 = "0.11.0"

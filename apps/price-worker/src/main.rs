@@ -561,6 +561,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             info!("[DeltaLoop][{}] No signal this 5m bar — waiting", sym);
                         }
+
+                        // ── 6. Post signal state to server dashboard ──────────────
+                        let base_sym = if sym.contains("BTC") { "BTC" } else if sym.contains("ETH") { "ETH" } else { "SOL" };
+                        let direction_str = if trend_up || bullish_cross { "LONG" } else if trend_down || bearish_cross { "SHORT" } else { "FLAT" };
+                        let action_str = if signal.is_some() { "ENTRY" } else if live_position.is_some() { "HOLD" } else { "FLAT" };
+                        
+                        let server_url = std::env::var("PRICE_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
+                        let signal_payload = serde_json::json!({
+                            "symbol": base_sym,
+                            "price": current_price,
+                            "ema9": ema9_now,
+                            "ema21": ema21_now,
+                            "atr": atr,
+                            "direction": direction_str,
+                            "action": action_str,
+                            "bull_cross": bullish_cross,
+                            "bear_cross": bearish_cross,
+                            "leverage": max_lev,
+                            "margin_usdt": margin_usdt,
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        });
+                        
+                        let _ = reqwest::Client::new()
+                            .post(format!("{}/live-status/crypto", server_url))
+                            .json(&signal_payload)
+                            .timeout(std::time::Duration::from_secs(3))
+                            .send()
+                            .await;
                     } // end loop
                 }); // end tokio::spawn per symbol
             }

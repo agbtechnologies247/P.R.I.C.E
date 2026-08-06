@@ -14,6 +14,7 @@ use price_broker::{Broker, OrderRequest, Side};
 use price_timeseries::TimescaleClient;
 
 use std::sync::RwLock;
+use std::collections::HashMap;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct LiveStatusInfo {
@@ -34,12 +35,40 @@ struct LiveStatusInfo {
     sol_price: f64,
 }
 
+/// Per-symbol live signal state posted by the price-worker 5m trading loop.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+struct CryptoSignal {
+    symbol: String,
+    price: f64,
+    ema9: f64,
+    ema21: f64,
+    atr: f64,
+    /// "LONG" | "SHORT" | "FLAT"
+    direction: String,
+    /// "ENTRY" | "EXIT" | "HOLD"
+    action: String,
+    /// EMA crossover bull flag
+    bull_cross: bool,
+    /// EMA crossover bear flag
+    bear_cross: bool,
+    leverage: u32,
+    margin_usdt: f64,
+    timestamp: String,
+}
+
 struct AppState {
+    /// Primary broker used for Fyers live trading (via HybridBroker or python-broker)
     broker: Arc<dyn price_broker::Broker>,
+    /// Dedicated Delta Exchange client for live crypto positions/orders/balance
+    delta_client: Arc<price_broker::DeltaExchangeClient>,
+    /// Paper trading broker (10 000 INR virtual capital)
+    paper_broker: Arc<price_broker::PaperBroker>,
     python_broker_url: String,
     db: TimescaleClient,
     live_status: RwLock<Option<LiveStatusInfo>>,
     crypto_prices: Arc<tokio::sync::Mutex<std::collections::HashMap<String, f64>>>,
+    /// Per-symbol crypto signals from the 5m Delta loop (BTC/ETH/SOL)
+    crypto_signals: RwLock<std::collections::HashMap<String, CryptoSignal>>,
 }
 
 #[tokio::main]
@@ -54,16 +83,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let python_broker_url = std::env::var("PYTHON_BROKER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
 
-    // 2. Setup Broker
-    let broker: Arc<dyn price_broker::Broker> = if let Ok(delta_key) = std::env::var("DELTA_API_KEY") {
-        let delta_secret = std::env::var("DELTA_API_SECRET").unwrap_or_default();
-        let delta_url = std::env::var("DELTA_BASE_URL").unwrap_or_else(|_| "https://api.delta.exchange".to_string());
-        info!("Initializing DeltaExchangeClient with API Key: {}...", delta_key);
-        Arc::new(price_broker::DeltaExchangeClient::new(&delta_url, Some(delta_key), Some(delta_secret)))
-    } else {
-        info!("Initializing HybridBroker (simultaneous Live + Paper trading)...");
+    // 2. Setup Brokers (Fyers via HybridBroker, Delta standalone, Paper standalone)
+    let broker: Arc<dyn price_broker::Broker> = {
+        info!("Initializing HybridBroker (Fyers live + Paper trading)...");
         Arc::new(price_broker::HybridBroker::new(&python_broker_url, 10000.0))
     };
+
+    let delta_client = {
+        let delta_key    = std::env::var("DELTA_API_KEY").ok();
+        let delta_secret = std::env::var("DELTA_API_SECRET").ok();
+        let delta_url    = std::env::var("DELTA_BASE_URL")
+            .unwrap_or_else(|_| "https://api.india.delta.exchange".to_string());
+        info!("Initializing Delta Exchange client (key={})...",
+            delta_key.as_deref().unwrap_or("<none>"));
+        Arc::new(price_broker::DeltaExchangeClient::new(&delta_url, delta_key, delta_secret))
+    };
+
+    let paper_broker = Arc::new(price_broker::PaperBroker::new(10_000.0));
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5433/price".to_string());
@@ -74,10 +110,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(AppState {
         broker,
+        delta_client,
+        paper_broker,
         python_broker_url: python_broker_url.clone(),
         db: db.clone(),
         live_status: RwLock::new(None),
         crypto_prices: crypto_prices.clone(),
+        crypto_signals: RwLock::new(std::collections::HashMap::new()),
     });
 
     // Spawn server-side ticker polling loop for BTC, ETH, SOL
@@ -195,6 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/broker/auth_url", get(auth_url_handler))
         .route("/broker/login_token", post(login_token_handler))
         .route("/live-status", get(get_live_status_handler).post(post_live_status_handler))
+        .route("/live-status/crypto", get(get_crypto_signal_handler).post(post_crypto_signal_handler))
         .route("/database/jobs", get(database_jobs_handler))
         .route("/database/candles-preview", get(candles_preview_handler))
         .route("/database/download-status", get(download_status_handler))
@@ -582,6 +622,7 @@ async fn index_handler() -> Html<&'static str> {
                         <span>Live Opportunity & Quantitative Decision Pipeline</span>
                         <span id="last-update-time" style="font-size: 0.75rem; color: var(--danger); font-weight: 600; letter-spacing: 0.05em; background: rgba(239, 68, 68, 0.1); padding: 0.2rem 0.6rem; border-radius: 4px;">Worker offline</span>
                     </div>
+                    <h3 style="font-size: 0.75rem; color: var(--success); margin-bottom: 0.75rem; letter-spacing: 0.08em; opacity: 0.8;">📊 NIFTY OPTIONS — NSE/FYERS</h3>
                     <div class="metrics-grid" style="margin-bottom: 1.5rem;">
                         <div class="metric-card" style="padding: 1rem;">
                             <div class="metric-label">Target Symbol / Contract</div>
@@ -598,7 +639,7 @@ async fn index_handler() -> Html<&'static str> {
                             <div class="metric-value" id="opp-quality-score" style="color: var(--warning);">0.0</div>
                         </div>
                     </div>
-                    <div class="metrics-grid">
+                    <div class="metrics-grid" style="margin-bottom: 1.5rem;">
                         <div class="metric-card" style="padding: 1rem; background: rgba(255,255,255,0.01);">
                             <div class="metric-label">Opportunity Confidence</div>
                             <div class="metric-value" id="opp-confidence">0.0%</div>
@@ -612,11 +653,60 @@ async fn index_handler() -> Html<&'static str> {
                             <div class="metric-value" id="opp-ml-confidence">0.0%</div>
                         </div>
                     </div>
+
+                    <!-- ===== CRYPTO FUTURES SIGNALS — DELTA EXCHANGE ===== -->
+                    <div style="border-top: 1px solid rgba(255,255,255,0.06); padding-top: 1rem; margin-top: 0.25rem;">
+                        <h3 style="font-size: 0.75rem; color: #f59e0b; margin-bottom: 0.75rem; letter-spacing: 0.08em; opacity: 0.9;">⚡ CRYPTO PERPETUALS — DELTA EXCHANGE (5m Loop)</h3>
+                        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;">
+                            <!-- BTC -->
+                            <div style="background: rgba(251,191,36,0.05); border: 1px solid rgba(251,191,36,0.2); border-radius: 12px; padding: 1rem;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem;">
+                                    <span style="font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: #fbbf24; font-size: 0.9rem;">₿ BTC (200x)</span>
+                                    <span id="btc-sig-badge" class="status-badge badge-wait" style="font-size: 0.65rem; padding: 0.2rem 0.5rem;">HOLD</span>
+                                </div>
+                                <div style="font-size: 1.1rem; font-weight: 700; color: #fbbf24; font-family: 'Space Grotesk', sans-serif; margin-bottom: 0.5rem;" id="btc-sig-price">$0.00</div>
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; font-size: 0.75rem; color: var(--text-muted);">
+                                    <span>EMA9: <strong id="btc-ema9" style="color: var(--text-main);">—</strong></span>
+                                    <span>EMA21: <strong id="btc-ema21" style="color: var(--text-main);">—</strong></span>
+                                    <span>ATR: <strong id="btc-atr" style="color: var(--text-main);">—</strong></span>
+                                    <span id="btc-direction-lbl" style="color: var(--text-muted);">FLAT</span>
+                                </div>
+                            </div>
+                            <!-- ETH -->
+                            <div style="background: rgba(99,102,241,0.05); border: 1px solid rgba(99,102,241,0.2); border-radius: 12px; padding: 1rem;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem;">
+                                    <span style="font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: #818cf8; font-size: 0.9rem;">Ξ ETH (200x)</span>
+                                    <span id="eth-sig-badge" class="status-badge badge-wait" style="font-size: 0.65rem; padding: 0.2rem 0.5rem;">HOLD</span>
+                                </div>
+                                <div style="font-size: 1.1rem; font-weight: 700; color: #818cf8; font-family: 'Space Grotesk', sans-serif; margin-bottom: 0.5rem;" id="eth-sig-price">$0.00</div>
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; font-size: 0.75rem; color: var(--text-muted);">
+                                    <span>EMA9: <strong id="eth-ema9" style="color: var(--text-main);">—</strong></span>
+                                    <span>EMA21: <strong id="eth-ema21" style="color: var(--text-main);">—</strong></span>
+                                    <span>ATR: <strong id="eth-atr" style="color: var(--text-main);">—</strong></span>
+                                    <span id="eth-direction-lbl" style="color: var(--text-muted);">FLAT</span>
+                                </div>
+                            </div>
+                            <!-- SOL -->
+                            <div style="background: rgba(16,185,129,0.05); border: 1px solid rgba(16,185,129,0.2); border-radius: 12px; padding: 1rem;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem;">
+                                    <span style="font-weight: 700; font-family: 'Space Grotesk', sans-serif; color: #34d399; font-size: 0.9rem;">◎ SOL (100x)</span>
+                                    <span id="sol-sig-badge" class="status-badge badge-wait" style="font-size: 0.65rem; padding: 0.2rem 0.5rem;">HOLD</span>
+                                </div>
+                                <div style="font-size: 1.1rem; font-weight: 700; color: #34d399; font-family: 'Space Grotesk', sans-serif; margin-bottom: 0.5rem;" id="sol-sig-price">$0.00</div>
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; font-size: 0.75rem; color: var(--text-muted);">
+                                    <span>EMA9: <strong id="sol-ema9" style="color: var(--text-main);">—</strong></span>
+                                    <span>EMA21: <strong id="sol-ema21" style="color: var(--text-main);">—</strong></span>
+                                    <span>ATR: <strong id="sol-atr" style="color: var(--text-main);">—</strong></span>
+                                    <span id="sol-direction-lbl" style="color: var(--text-muted);">FLAT</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="card">
-                    <div class="card-title">Portfolio & Account Balance (Dual Brokers)</div>
-                    
+                    <div class="card-title">Portfolio & Account Balance (Triple Broker)</div>
+
                     <h3 style="font-size: 0.85rem; color: var(--success); margin-bottom: 0.75rem; letter-spacing: 0.05em;">📈 LIVE FYERS ACCOUNT</h3>
                     <div class="metrics-grid" style="margin-bottom: 1.5rem;">
                         <div class="metric-card" style="padding: 1rem;">
@@ -633,7 +723,23 @@ async fn index_handler() -> Html<&'static str> {
                         </div>
                     </div>
 
-                    <h3 style="font-size: 0.85rem; color: var(--primary); margin-bottom: 0.75rem; letter-spacing: 0.05em;">🤖 PAPER / DELTA TRADING ACCOUNT</h3>
+                    <h3 style="font-size: 0.85rem; color: #fbbf24; margin-bottom: 0.75rem; letter-spacing: 0.05em;">⚡ LIVE DELTA ACCOUNT (USDT Perpetuals)</h3>
+                    <div class="metrics-grid" style="margin-bottom: 1.5rem;">
+                        <div class="metric-card" style="padding: 1rem; border-color: rgba(251,191,36,0.15);">
+                            <div class="metric-label">Total Limit</div>
+                            <div class="metric-value" style="color: #fbbf24;" id="delta-val-limit">$0.00</div>
+                        </div>
+                        <div class="metric-card" style="padding: 1rem; border-color: rgba(251,191,36,0.15);">
+                            <div class="metric-label">Utilized Margin</div>
+                            <div class="metric-value" id="delta-val-utilized">$0.00</div>
+                        </div>
+                        <div class="metric-card" style="padding: 1rem; border-color: rgba(251,191,36,0.15);">
+                            <div class="metric-label">Available USDT</div>
+                            <div class="metric-value" style="color: #fbbf24;" id="delta-val-available">$0.00</div>
+                        </div>
+                    </div>
+
+                    <h3 style="font-size: 0.85rem; color: var(--primary); margin-bottom: 0.75rem; letter-spacing: 0.05em;">🤖 PAPER TRADING ACCOUNT</h3>
                     <div class="metrics-grid">
                         <div class="metric-card" style="padding: 1rem;">
                             <div class="metric-label">Total Capital Limit</div>
@@ -661,11 +767,12 @@ async fn index_handler() -> Html<&'static str> {
                                 <th>Avg Price</th>
                                 <th>LTP</th>
                                 <th>PnL</th>
+                                <th>Broker</th>
                             </tr>
                         </thead>
                         <tbody>
                             <tr>
-                                <td colspan="6" style="text-align: center; color: var(--text-muted);">No active positions found</td>
+                                <td colspan="7" style="text-align: center; color: var(--text-muted);">No active positions found</td>
                             </tr>
                         </tbody>
                     </table>
@@ -680,13 +787,14 @@ async fn index_handler() -> Html<&'static str> {
                                 <th>Symbol</th>
                                 <th>Side</th>
                                 <th>Qty</th>
-                                <th>Avg Price</th>
+                                <th>Price</th>
                                 <th>Status</th>
+                                <th>Broker</th>
                             </tr>
                         </thead>
                         <tbody>
                             <tr>
-                                <td colspan="6" style="text-align: center; color: var(--text-muted);">No recent orders found</td>
+                                <td colspan="7" style="text-align: center; color: var(--text-muted);">No recent orders found</td>
                             </tr>
                         </tbody>
                     </table>
@@ -1206,21 +1314,26 @@ async fn index_handler() -> Html<&'static str> {
             }
         }
 
-        // Fetch Portfolio and balance
+        // Fetch Portfolio and balance (Triple Broker)
         async function fetchPortfolio() {
             try {
                 const response = await fetch('/portfolio');
                 const data = await response.json();
                 
                 if (data.live_funds) {
-                    document.getElementById('live-val-limit').textContent = `₹${data.live_funds.limit_amount.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
-                    document.getElementById('live-val-utilized').textContent = `₹${data.live_funds.utilised_balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
-                    document.getElementById('live-val-available').textContent = `₹${data.live_funds.available_balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('live-val-limit').textContent = `₹${(data.live_funds.limit_amount || 0).toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('live-val-utilized').textContent = `₹${(data.live_funds.utilised_balance || 0).toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('live-val-available').textContent = `₹${(data.live_funds.available_balance || 0).toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                }
+                if (data.delta_funds) {
+                    document.getElementById('delta-val-limit').textContent = `$${(data.delta_funds.limit_amount || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    document.getElementById('delta-val-utilized').textContent = `$${(data.delta_funds.utilised_balance || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                    document.getElementById('delta-val-available').textContent = `$${(data.delta_funds.available_balance || 0).toLocaleString('en-US', {minimumFractionDigits: 2})}`;
                 }
                 if (data.paper_funds) {
-                    document.getElementById('paper-val-limit').textContent = `₹${data.paper_funds.limit_amount.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
-                    document.getElementById('paper-val-utilized').textContent = `₹${data.paper_funds.utilised_balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
-                    document.getElementById('paper-val-available').textContent = `₹${data.paper_funds.available_balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('paper-val-limit').textContent = `₹${(data.paper_funds.limit_amount || 0).toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('paper-val-utilized').textContent = `₹${(data.paper_funds.utilised_balance || 0).toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
+                    document.getElementById('paper-val-available').textContent = `₹${(data.paper_funds.available_balance || 0).toLocaleString('en-IN', {minimumFractionDigits: 2})}`;
                 }
 
                 const posTableBody = document.querySelector('#positions-table tbody');
@@ -1229,18 +1342,20 @@ async fn index_handler() -> Html<&'static str> {
                     data.positions.forEach(p => {
                         const row = document.createElement('tr');
                         const pnlClass = p.pnl >= 0 ? 'pnl-green' : 'pnl-red';
+                        const currency = p.broker === 'DELTA' ? '$' : '₹';
                         row.innerHTML = `
                             <td><strong>${p.symbol}</strong></td>
                             <td>${p.side === 1 ? 'BUY' : 'SELL'}</td>
                             <td>${p.buy_qty || p.sell_qty}</td>
-                            <td>₹${p.avg_price.toFixed(2)}</td>
-                            <td>₹${p.current_price.toFixed(2)}</td>
-                            <td class="${pnlClass}">₹${p.pnl.toFixed(2)}</td>
+                            <td>${currency}${(p.avg_price || 0).toFixed(2)}</td>
+                            <td>${currency}${(p.current_price || 0).toFixed(2)}</td>
+                            <td class="${pnlClass}">${currency}${(p.pnl || 0).toFixed(2)}</td>
+                            <td><span style="font-weight:600; font-size:0.8rem; color: ${p.broker === 'DELTA' ? '#fbbf24' : p.broker === 'FYERS' ? 'var(--success)' : 'var(--primary)'}">${p.broker || 'PAPER'}</span></td>
                         `;
                         posTableBody.appendChild(row);
                     });
                 } else {
-                    posTableBody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No active positions found</td></tr>`;
+                    posTableBody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">No active positions found</td></tr>`;
                 }
             } catch (e) {
                 console.error("Failed to fetch portfolio: ", e);
@@ -1258,18 +1373,21 @@ async fn index_handler() -> Html<&'static str> {
                     ordTableBody.innerHTML = '';
                     data.orders.forEach(o => {
                         const row = document.createElement('tr');
+                        const brokerTag = o.broker_tag || (o.broker && o.broker.toString()) || 'PAPER';
+                        const currency = brokerTag === 'DELTA' ? '$' : '₹';
                         row.innerHTML = `
-                            <td><code>${o.id.substring(0, 8)}...</code></td>
+                            <td><code>${(o.id || '').substring(0, 8)}...</code></td>
                             <td><strong>${o.symbol}</strong></td>
-                            <td>${o.side === 1 ? 'BUY' : 'SELL'}</td>
-                            <td>${o.qty}</td>
-                            <td>₹${o.avg_price.toFixed(2)}</td>
+                            <td>${o.side === 1 || o.side === 'Buy' ? 'BUY' : 'SELL'}</td>
+                            <td>${o.quantity || o.qty || 0}</td>
+                            <td>${currency}${(o.avg_price || o.limit_price || 0).toFixed(2)}</td>
                             <td><span style="font-weight:600; color: ${o.status === 'FILLED' ? 'var(--success)' : 'var(--text-muted)'}">${o.status}</span></td>
+                            <td><span style="font-weight:600; font-size:0.8rem; color: ${brokerTag === 'DELTA' ? '#fbbf24' : brokerTag === 'FYERS' ? 'var(--success)' : 'var(--primary)'}">${brokerTag}</span></td>
                         `;
                         ordTableBody.appendChild(row);
                     });
                 } else {
-                    ordTableBody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No recent orders found</td></tr>`;
+                    ordTableBody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">No recent orders found</td></tr>`;
                 }
             } catch (e) {
                 console.error("Failed to fetch orders: ", e);
@@ -1731,6 +1849,49 @@ async fn index_handler() -> Html<&'static str> {
             fetchCandlesPreview();
         });
 
+        async function fetchCryptoSignals() {
+            try {
+                const res = await fetch('/live-status/crypto');
+                const data = await res.json();
+                if (data.status === 'success' && data.signals) {
+                    const symbols = ['BTC', 'ETH', 'SOL'];
+                    symbols.forEach(sym => {
+                        const s = data.signals[sym];
+                        if (!s) return;
+                        const key = sym.toLowerCase();
+                        
+                        const priceElem = document.getElementById(`${key}-sig-price`);
+                        if (priceElem && s.price > 0) {
+                            priceElem.textContent = `$${s.price.toLocaleString('en-US', {minimumFractionDigits: 2})}`;
+                        }
+                        
+                        const badge = document.getElementById(`${key}-sig-badge`);
+                        if (badge) {
+                            badge.textContent = s.action || 'HOLD';
+                            badge.className = 'status-badge ' + (s.action === 'ENTRY' ? 'badge-trade' : s.action === 'EXIT' ? 'badge-cancel' : 'badge-wait');
+                        }
+                        
+                        const ema9 = document.getElementById(`${key}-ema9`);
+                        if (ema9) ema9.textContent = s.ema9 > 0 ? `$${s.ema9.toFixed(2)}` : '—';
+                        
+                        const ema21 = document.getElementById(`${key}-ema21`);
+                        if (ema21) ema21.textContent = s.ema21 > 0 ? `$${s.ema21.toFixed(2)}` : '—';
+                        
+                        const atr = document.getElementById(`${key}-atr`);
+                        if (atr) atr.textContent = s.atr > 0 ? `$${s.atr.toFixed(2)}` : '—';
+                        
+                        const dir = document.getElementById(`${key}-direction-lbl`);
+                        if (dir) {
+                            dir.textContent = s.direction || 'FLAT';
+                            dir.style.color = s.direction === 'LONG' ? 'var(--success)' : s.direction === 'SHORT' ? 'var(--danger)' : 'var(--text-muted)';
+                        }
+                    });
+                }
+            } catch (e) {
+                console.error("Failed to fetch crypto signals: ", e);
+            }
+        }
+
         // Initialize and poll status
         fetchAuthUrl();
         checkHealth();
@@ -1739,11 +1900,13 @@ async fn index_handler() -> Html<&'static str> {
         checkDownloadStatus();
         fetchLiveStatus();
         fetchCryptoLiveQuotes();
+        fetchCryptoSignals();
         fetchPipelineJobs();
         fetchCandlesPreview();
         
         setInterval(fetchLiveStatus, 1000);
         setInterval(fetchCryptoLiveQuotes, 3000);
+        setInterval(fetchCryptoSignals, 3000);
         setInterval(() => {
             fetchPortfolio();
             fetchOrders();
@@ -1791,27 +1954,74 @@ async fn crypto_prices_handler(Extension(state): Extension<Arc<AppState>>) -> Js
 }
 
 async fn portfolio_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serde_json::Value> {
-    let (live_funds, paper_funds) = if let Some(hybrid) = state.broker.as_any().downcast_ref::<price_broker::HybridBroker>() {
-        (hybrid.live.funds().await.ok(), hybrid.paper.funds().await.ok())
+    // ── Fyers / HybridBroker (live Fyers + embedded paper) ─────────────────────
+    let (fyers_funds, hybrid_paper_funds) =
+        if let Some(hybrid) = state.broker.as_any().downcast_ref::<price_broker::HybridBroker>() {
+            (hybrid.live.funds().await.ok(), hybrid.paper.funds().await.ok())
+        } else {
+            (state.broker.funds().await.ok(), None)
+        };
+
+    // ── Delta Exchange (live perpetuals account) ────────────────────────────────
+    let delta_funds     = state.delta_client.funds().await.ok();
+    let delta_positions = state.delta_client.positions().await.unwrap_or_default();
+
+    // ── Paper broker (standalone 10 000 INR virtual capital) ───────────────────
+    let paper_funds = if let Some(pf) = hybrid_paper_funds {
+        Some(pf)
     } else {
-        (state.broker.funds().await.ok(), None)
+        state.paper_broker.funds().await.ok()
     };
-    let positions = state.broker.positions().await.unwrap_or_default();
-    let holdings = state.broker.holdings().await.unwrap_or_default();
-    
+    let paper_positions = state.paper_broker.positions().await.unwrap_or_default();
+
+    // ── Fyers positions (from live broker) ─────────────────────────────────────
+    let fyers_positions = state.broker.positions().await.unwrap_or_default();
+    let fyers_holdings  = state.broker.holdings().await.unwrap_or_default();
+
+    // ── Merge all positions with broker tag injected into JSON ─────────────────
+    let tag_positions = |positions: Vec<price_broker::Position>, broker: &str| -> Vec<serde_json::Value> {
+        positions.into_iter().map(|p| {
+            let mut v = serde_json::to_value(&p).unwrap_or_default();
+            if let serde_json::Value::Object(ref mut m) = v {
+                m.insert("broker".to_string(), serde_json::Value::String(broker.to_string()));
+            }
+            v
+        }).collect()
+    };
+
+    let mut all_positions: Vec<serde_json::Value> = Vec::new();
+    all_positions.extend(tag_positions(fyers_positions, "FYERS"));
+    all_positions.extend(tag_positions(delta_positions, "DELTA"));
+    all_positions.extend(tag_positions(paper_positions, "PAPER"));
+
     Json(serde_json::json!({
-        "live_funds": live_funds,
+        "live_funds":  fyers_funds,
+        "delta_funds": delta_funds,
         "paper_funds": paper_funds,
-        "positions": positions,
-        "holdings": holdings
+        "positions":   all_positions,
+        "holdings":    fyers_holdings
     }))
 }
 
 async fn orders_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serde_json::Value> {
-    let orders = state.broker.orderbook().await.unwrap_or_default();
-    Json(serde_json::json!({
-        "orders": orders
-    }))
+    let tag_orders = |orders: Vec<price_broker::Order>, broker_tag: &str| -> Vec<serde_json::Value> {
+        orders.into_iter().map(|o| {
+            let mut v = serde_json::to_value(&o).unwrap_or_default();
+            if let serde_json::Value::Object(ref mut m) = v {
+                m.insert("broker_tag".to_string(), serde_json::Value::String(broker_tag.to_string()));
+            }
+            v
+        }).collect()
+    };
+    let fyers_orders = state.broker.orderbook().await.unwrap_or_default();
+    let delta_orders = state.delta_client.orderbook().await.unwrap_or_default();
+    let paper_orders = state.paper_broker.orderbook().await.unwrap_or_default();
+
+    let mut all_orders: Vec<serde_json::Value> = Vec::new();
+    all_orders.extend(tag_orders(fyers_orders, "FYERS"));
+    all_orders.extend(tag_orders(delta_orders, "DELTA"));
+    all_orders.extend(tag_orders(paper_orders, "PAPER"));
+    Json(serde_json::json!({ "orders": all_orders }))
 }
 
 async fn trades_handler(Extension(state): Extension<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -1835,9 +2045,9 @@ async fn place_order_handler(
 ) -> Json<serde_json::Value> {
     let side = if payload.side.to_uppercase() == "BUY" { Side::Buy } else { Side::Sell };
     let req = OrderRequest {
-        symbol: payload.symbol,
+        symbol: payload.symbol.clone(),
         qty: payload.qty,
-        r#type: 1, // Limit order
+        r#type: 1, // Always limit order for futures
         side,
         limit_price: payload.limit_price,
         stop_price: 0.0,
@@ -1847,8 +2057,13 @@ async fn place_order_handler(
         client_id: None,
         time_in_force: None,
     };
-    
-    match state.broker.place_order(req).await {
+
+    // Route crypto perpetuals to Delta Exchange; everything else to Fyers
+    let is_crypto = payload.symbol.contains("PERP") || payload.symbol.starts_with("BTC") ||
+        payload.symbol.starts_with("ETH") || payload.symbol.starts_with("SOL");
+    let broker: &dyn price_broker::Broker = if is_crypto { state.delta_client.as_ref() } else { state.broker.as_ref() };
+
+    match broker.place_order(req).await {
         Ok(resp) => Json(serde_json::json!({
             "status": "success",
             "order_id": resp.order_id,
@@ -2363,6 +2578,57 @@ async fn post_live_status_handler(
     Json(serde_json::json!({
         "status": "success"
     }))
+}
+
+/// GET /live-status/crypto — returns all per-symbol crypto signals
+async fn get_crypto_signal_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let signals = state.crypto_signals.read().unwrap().clone();
+    let cp      = state.crypto_prices.lock().await;
+    // Merge in latest live prices even if no signal has been posted yet
+    let mut merged: std::collections::HashMap<String, serde_json::Value> = HashMap::new();
+    for sym in &["BTC", "ETH", "SOL"] {
+        let price = cp.get(*sym).copied().unwrap_or(0.0);
+        if let Some(sig) = signals.get(*sym) {
+            let mut v = serde_json::to_value(sig).unwrap_or_default();
+            if let serde_json::Value::Object(ref mut m) = v {
+                if m.get("price").and_then(|p| p.as_f64()).unwrap_or(0.0) == 0.0 && price > 0.0 {
+                    m.insert("price".to_string(), serde_json::json!(price));
+                }
+            }
+            merged.insert(sym.to_string(), v);
+        } else {
+            merged.insert(sym.to_string(), serde_json::json!({
+                "symbol":      sym,
+                "price":       price,
+                "ema9":        0.0,
+                "ema21":       0.0,
+                "atr":         0.0,
+                "direction":   "FLAT",
+                "action":      "HOLD",
+                "bull_cross":  false,
+                "bear_cross":  false,
+                "leverage":    if *sym == "SOL" { 100u32 } else { 200u32 },
+                "margin_usdt": 0.0,
+                "timestamp":   ""
+            }));
+        }
+    }
+    Json(serde_json::json!({
+        "status":  "success",
+        "signals": merged
+    }))
+}
+
+/// POST /live-status/crypto — price-worker posts one signal per 5m tick per symbol
+async fn post_crypto_signal_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(payload): Json<CryptoSignal>,
+) -> Json<serde_json::Value> {
+    let key = payload.symbol.clone();
+    state.crypto_signals.write().unwrap().insert(key, payload);
+    Json(serde_json::json!({ "status": "success" }))
 }
 
 async fn database_jobs_handler(
