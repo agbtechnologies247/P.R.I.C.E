@@ -516,37 +516,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     (current_price - tp_dist).max(0.01),
                                 ),
                             };
+                            // Deep price entry: place limit order at current price to capture deep fill
+                            let limit_entry_price = current_price;
                             // Contracts = (margin_usdt * leverage) / price
-                            let contracts = ((margin_usdt * max_lev as f64) / current_price).max(1.0) as i32;
+                            let contracts = ((margin_usdt * max_lev as f64) / limit_entry_price).max(1.0) as i32;
 
                             let bracket_req = price_broker::BracketOrderRequest {
                                 product_id: prod_id,
                                 side: entry_side.clone(),
                                 size: contracts,
-                                order_type: price_broker::OrderType::MarketOrder,
-                                limit_price: None,
+                                order_type: price_broker::OrderType::LimitOrder,
+                                limit_price: Some(limit_entry_price),
                                 stop_price: None,
                                 stop_loss_price: sl_price,
                                 take_profit_price: tp_price,
                                 trail_amount: None,
                             };
 
-                            info!("[DeltaLoop][{}] ENTRY {:?} {} contracts @ ~{:.2} | SL={:.2} TP={:.2}",
-                                sym, entry_side, contracts, current_price, sl_price, tp_price);
+                            info!("[DeltaLoop][{}] AUTOMATED LIMIT ENTRY {:?} {} contracts @ Limit {:.2} | SL={:.2} TP={:.2}",
+                                sym, entry_side, contracts, limit_entry_price, sl_price, tp_price);
 
-                            // Place LIVE bracket order
+                            // Place LIVE limit bracket order
                             match lc.place_bracket_order(&bracket_req).await {
-                                Ok(resp) => info!("[DeltaLoop][{}] LIVE ENTRY order placed: {}", sym, resp.order_id),
-                                Err(e)   => warn!("[DeltaLoop][{}] LIVE ENTRY order failed: {:?}", sym, e),
+                                Ok(resp) => info!("[DeltaLoop][{}] LIVE LIMIT ENTRY order placed: {}", sym, resp.order_id),
+                                Err(e)   => warn!("[DeltaLoop][{}] LIVE LIMIT ENTRY order failed: {:?}", sym, e),
                             }
 
-                            // Mirror as PAPER trade (no real keys)
+                            // Mirror as PAPER limit trade
                             let paper_req = price_broker::OrderRequest {
                                 symbol: sym.clone(),
                                 qty: contracts,
                                 side: entry_side,
-                                r#type: 2, // Market order
-                                limit_price: 0.0,
+                                r#type: 1, // Limit order
+                                limit_price: limit_entry_price,
                                 stop_price: 0.0,
                                 leverage: None,
                                 reduce_only: None,
@@ -555,8 +557,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 time_in_force: None,
                             };
                             match pc.place_order(paper_req).await {
-                                Ok(resp) => info!("[DeltaLoop][{}] PAPER ENTRY order placed: {}", sym, resp.order_id),
-                                Err(e)   => warn!("[DeltaLoop][{}] PAPER ENTRY order failed: {:?}", sym, e),
+                                Ok(resp) => info!("[DeltaLoop][{}] PAPER LIMIT ENTRY order placed: {}", sym, resp.order_id),
+                                Err(e)   => warn!("[DeltaLoop][{}] PAPER LIMIT ENTRY order failed: {:?}", sym, e),
                             }
                         } else {
                             info!("[DeltaLoop][{}] No signal this 5m bar — waiting", sym);
